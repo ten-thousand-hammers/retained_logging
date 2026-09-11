@@ -35,4 +35,4 @@ CREATE TABLE IF NOT EXISTS completions (
   process_id TEXT NOT NULL UNIQUE REFERENCES processes(id) ON DELETE CASCADE,
   ended_at INTEGER NOT NULL
 );
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;

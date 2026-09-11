@@ -39,12 +39,24 @@ module RetainedLogging
       operation = request.fetch("operation")
       version = db.get_first_value("PRAGMA user_version")
       if operation == "prepare"
-        return { outcome: "unavailable" } unless [ 0, 1 ].include?(version)
+        return { outcome: "unavailable" } unless [ 0, 1, 2 ].include?(version)
         db.execute("PRAGMA journal_mode = WAL")
-        transaction(db) { db.execute_batch(File.read(File.expand_path("schema.sql", __dir__))) }
+        # Rebuild the parent table without cascading deletion of retained children.
+        # Foreign keys must be disabled before opening the migration transaction.
+        db.execute("PRAGMA foreign_keys = OFF")
+        transaction(db) do
+          version = db.get_first_value("PRAGMA user_version")
+          raise SQLite3::Exception unless [ 0, 1, 2 ].include?(version)
+          if version == 1 && !db.table_info("processes").any? { |column| column["name"] == "sequence" }
+            db.execute_batch(File.read(File.expand_path("migrations/002_process_sequences.sql", __dir__)))
+          end
+          db.execute_batch(File.read(File.expand_path("schema.sql", __dir__)))
+          raise SQLite3::ConstraintException unless db.execute("PRAGMA foreign_key_check").empty?
+        end
+        db.execute("PRAGMA foreign_keys = ON")
         return { outcome: "ok" }
       end
-      return { outcome: "unavailable" } unless version == 1
+      return { outcome: "unavailable" } unless version == 2
       if operation == "summarize"
         # One SQLite snapshot covers the ingestion watermark, groups and coverage.
         return db.transaction { HistorySummary.new(db, request).call }

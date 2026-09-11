@@ -20,7 +20,7 @@ module RetainedLogging
         "events" => @db.get_first_value("SELECT COALESCE(MAX(id), 0) FROM events"),
         "checkpoints" => @db.get_first_value("SELECT COALESCE(MAX(id), 0) FROM checkpoints"),
         "completions" => @db.get_first_value("SELECT COALESCE(MAX(id), 0) FROM completions"),
-        "processes" => @db.get_first_value("SELECT COALESCE(MAX(rowid), 0) FROM processes")
+        "processes" => @db.get_first_value("SELECT COALESCE(MAX(sequence), 0) FROM processes")
       }
       predicates = [ "p.scope = ?", "p.component IN (#{([ '?' ] * @components.size).join(', ')})",
         "e.occurred_at >= ?", "e.occurred_at < ?", "e.id <= ?" ]
@@ -60,7 +60,7 @@ module RetainedLogging
       processes = @db.execute(<<~SQL, [ @watermark.fetch("completions"), @scope, component, @watermark.fetch("processes"), @end, @retained_start ])
         SELECT p.id, p.started_at, c.ended_at FROM processes p
         LEFT JOIN completions c ON c.process_id = p.id AND c.id <= ?
-        WHERE p.scope = ? AND p.component = ? AND p.rowid <= ? AND p.started_at < ?
+        WHERE p.scope = ? AND p.component = ? AND p.sequence <= ? AND p.started_at < ?
           AND (c.ended_at IS NULL OR c.ended_at > ?)
       SQL
       processes.each do |id, started, ended|

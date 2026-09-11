@@ -1,3 +1,4 @@
+require "monitor"
 require_relative "history"
 require_relative "broadcast_logger"
 
@@ -6,6 +7,7 @@ module RetainedLogging
   class Capture
     INTERVAL = 10
     MAX_INTERVAL = 30
+    STOP_LOCK_SECONDS = 1
 
     # Installation returns the logger that callers must retain.
     def self.install(logger, collector)
@@ -42,11 +44,11 @@ module RetainedLogging
     end
 
     def unsupported_source
-      @source_unsupported = true
+      @state_mutex.synchronize { @source_unsupported = true }
     end
 
     def interrupt
-      @failures += 1
+      @state_mutex.synchronize { @failures += 1 }
     end
 
     def record(severity, at, message)
@@ -87,19 +89,27 @@ module RetainedLogging
 
     def checkpoint
       start if @pid != Process.pid
-      guarded { checkpoint_locked(@clock.call) unless @stopped }
+      @state_mutex.synchronize { guarded { checkpoint_locked(@clock.call) unless @stopped } }
     end
 
     def stop
       return if @pid != Process.pid
-      guarded do
-        next if @stopped
-        now = @clock.call
-        if checkpoint_locked(now)
-          @history.finish_process(process_id: @process_id, at: now)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + STOP_LOCK_SECONDS
+      loop do
+        acquired = false
+        result = @state_mutex.synchronize do
+          guarded do
+            acquired = true
+            next true if @stopped
+            now = @clock.call
+            next false unless checkpoint_locked(now)
+            next false unless ok?(@history.finish_process(process_id: @process_id, at: now))
+            @stopped = true
+          end
         end
+        return result if acquired || Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+        sleep 0.01
       end
-      @stopped = true
     end
 
     private
@@ -107,20 +117,22 @@ module RetainedLogging
     def reset_process
       @pid = Process.pid
       @mutex = Mutex.new
-      @counts_mutex = Mutex.new
+      @state_mutex = Monitor.new
       @process_id = @abandoned_process_id = @thread = nil
       @failures = @acknowledged_failures = @informational = @unsupported = 0
       @stopped = false
     end
 
-    # Never queue application threads behind a slow history write. A skipped write
-    # invalidates the interval, and its message is neither buffered nor logged.
+    # Checkpoint finalization holds the state monitor through its bounded writes.
+    # Admission and failure accounting use the same monitor, so a failed attempt
+    # cannot slip between the failure snapshot and durable certification. Ordinary
+    # event writes still fail fast on lifecycle contention.
     def guarded
       mutex = @mutex
-      unless mutex.try_lock
-        interrupt
-        return false
+      acquired = @state_mutex.synchronize do
+        mutex.try_lock.tap { |locked| interrupt unless locked }
       end
+      return false unless acquired
       begin
         yield
       rescue StandardError
@@ -152,7 +164,7 @@ module RetainedLogging
         @abandoned_process_id, @process_id = @process_id, nil
         return false
       end
-      informational, unsupported = @counts_mutex.synchronize do
+      informational, unsupported = @state_mutex.synchronize do
         counts = [ @informational, @unsupported ]
         @informational = @unsupported = 0
         counts
@@ -174,10 +186,10 @@ module RetainedLogging
       end
     end
 
-    # This short lock never covers IO. Normal informational traffic must not
-    # create gaps merely because a durable checkpoint is being written.
+    # Informational traffic shares the finalization barrier and remains counted
+    # without creating a gap merely because a checkpoint is being written.
     def count(kind)
-      @counts_mutex.synchronize do
+      @state_mutex.synchronize do
         if kind == :informational
           @informational = [ @informational + 1, 2**31 - 1 ].min
         else

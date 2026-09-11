@@ -36,6 +36,12 @@ and scheduled `history.cleanup`. Standalone callers arrange logger assignment an
 lifecycle hooks; Rails callers can use the bundled integration below.
 History creation is explicit; ordinary writes and reads never prepare the schema.
 Writes have a one-second worker budget; reads have an eight-second budget.
+Checkpoint finalization serializes capture admission and failure accounting with
+persistence. Logging can wait for finalization (up to three writes during recovery,
+or four when stopping). Ordinary event-write contention still fails open and marks
+a gap. A contended or failed stop remains retryable; lifecycle-lock retries last
+at most one second. Preparation preserves non-reusable process registration
+sequences used by paginated coverage, including after cleanup.
 Failures return fixed outcomes and collection records gaps without raising into
 normal logging. Raw output through `<<` lacks severity metadata and invalidates
 coverage. Output that bypasses the application logger is outside this guarantee.

@@ -1,5 +1,6 @@
 CREATE TABLE IF NOT EXISTS processes (
-  id TEXT PRIMARY KEY,
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
   scope TEXT NOT NULL,
   component TEXT NOT NULL CHECK (component IN ('web', 'job')),
   started_at INTEGER NOT NULL,

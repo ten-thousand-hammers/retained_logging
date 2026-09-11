@@ -32,7 +32,8 @@ coverage when registered sources filter INFO. A host can install a
 with `Capture.install` once storage configuration is ready.
 
 The host supplies `web`/`job` attribution, durable storage, a stable scope and key,
-logger assignment, activation, process lifecycle hooks and scheduled `history.cleanup`.
+and scheduled `history.cleanup`. Standalone callers arrange logger assignment and
+lifecycle hooks; Rails callers can use the bundled integration below.
 History creation is explicit; ordinary writes and reads never prepare the schema.
 Writes have a one-second worker budget; reads have an eight-second budget.
 Failures return fixed outcomes and collection records gaps without raising into
@@ -65,6 +66,56 @@ bin/bundle exec ruby gems/retained_logging/test/retained_logging_test.rb
 The tests build and extract the gem, then exercise its storage worker and summaries
 from outside the repository. To extract later, copy this directory, provide a bundle
 with its gemspec dependencies and test dependencies (`minitest`), and implement the
-host wiring described above. MCP, Dokploy, Rails secrets, application scheduling,
+host settings described below. MCP, Dokploy, Rails secrets, application scheduling,
 and deployment-volume verification remain host responsibilities. No publication
 workflow or production rollout is implied by the package tests.
+
+## Rails integration
+
+The gem loads its Railtie when required after Rails. Rails, Solid Queue and Puma
+remain optional host dependencies; the adapters are verified with Rails 8.1.3.1,
+Solid Queue 1.6.0 and Puma 8.0.2.
+
+```ruby
+# config/environments/production.rb
+config.retained_logging.enabled = true
+config.retained_logging.component = "web" # explicitly use "job" in the job component
+
+# config/initializers/retained_logging.rb
+Rails.application.config.retained_logging.history = -> {
+  RetainedLogging::History.new(path: durable_path, scope: deployment_scope,
+    key: Rails.application.key_generator.generate_key("your_app/retained_history/v1", 32))
+}
+
+# config/puma.rb
+plugin :retained_logging
+```
+
+Use the application's existing configuration to supply the factory values. The
+factory also serves `bin/rails retained_logging:prepare` and scheduled
+`RetainedLogging.rails_integration.history.cleanup`. Preparation remains explicit;
+keep the existing application's schedule for bounded 48-hour cleanup. Disabled
+capture still permits preparation, cleanup and retained reads.
+
+The Railtie installs the public broadcast logger before Rails shares it, attaches
+capture after Rails configures key derivation, and registers process hooks once. Rails, Active Job,
+and Solid Queue share one collector per OS process. Solid Queue start callbacks
+restart checkpoint threads after forks. Its post-drain exit callbacks checkpoint
+but keep capture attached for final instrumentation and other async roles; an
+unfinished worker pool invalidates that interval. Ruby's `at_exit` closes normal
+lifecycles; its handler is registered before application initializers so their exit
+logging runs first. Hard exits leave an unverified tail.
+
+Puma requires the single plugin declaration because its launcher controls fork and
+restart hooks outside Rails boot. The plugin ends preloaded collection before
+forking, restarts child collection, and finalizes before hot restart's `exec`.
+Normal exit waits until requests drain and final application exit handlers log.
+The host needs no collector code in `bin/jobs` or its Solid Queue initializer.
+Use separately attributed web and job processes; a shared-process queue cannot
+assign different component labels to its shared logger.
+
+Grabarr's process integration tests run a disposable Rails app, real Solid Queue
+workers in fork and async modes, and Puma in single and cluster modes, including
+preloading and hot restart. They cover
+shutdown draining, final logging, disabled capture and unfinished hard-exit tails.
+These sandbox checks do not verify production volumes or a full day of collection.

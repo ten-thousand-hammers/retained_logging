@@ -35,7 +35,10 @@ The host supplies `web`/`job` attribution, durable storage, a stable scope and k
 and scheduled `history.cleanup`. Standalone callers arrange logger assignment and
 lifecycle hooks; Rails callers can use the bundled integration below.
 History creation is explicit; ordinary writes and reads never prepare the schema.
-Writes have a one-second worker budget; reads have an eight-second budget.
+Capture writes and cleanup have a one-second worker budget; reads have an
+eight-second budget. Explicit schema preparation has a separate ten-second budget
+for schema creation and migration on durable storage. It never runs during capture
+or an inspection request.
 Checkpoint finalization serializes capture admission and failure accounting with
 persistence. Logging can wait for finalization (up to three writes during recovery,
 or four when stopping). Ordinary event-write contention still fails open and marks

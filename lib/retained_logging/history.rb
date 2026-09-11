@@ -9,6 +9,7 @@ module RetainedLogging
   class History
     RETENTION_SECONDS = 48 * 60 * 60
     BUDGET_SECONDS = 1
+    PREPARE_BUDGET_SECONDS = 10
     READ_BUDGET_SECONDS = 8
     READ_RESPONSE_BYTES = 240 * 1024
     BATCH_SIZE = 100
@@ -129,7 +130,13 @@ module RetainedLogging
 
     def execute(operation, **arguments)
       read = operation == "summarize"
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + (read ? READ_BUDGET_SECONDS : BUDGET_SECONDS)
+      # Explicit schema creation/migration is maintenance, outside capture and MCP.
+      budget = case operation
+      when "prepare" then PREPARE_BUDGET_SECONDS
+      when "summarize" then READ_BUDGET_SECONDS
+      else BUDGET_SECONDS
+      end
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + budget
       # Isolate SQLite's GVL-holding calls so cancellation cannot harm the host.
       # Use the host-selected dependency versions without booting its whole bundle
       # on every write. Inherited Ruby preloads must not run inside this worker.

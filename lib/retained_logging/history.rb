@@ -3,6 +3,7 @@ require "openssl"
 require "securerandom"
 require "open3"
 require "active_support/message_verifier"
+require_relative "process_owner"
 
 module RetainedLogging
   # Internal persistence API, never an MCP argument surface. No Rails connections or logger.
@@ -30,9 +31,13 @@ module RetainedLogging
       execute("prepare")
     end
 
-    def start_process(component:, at: Time.now)
+    def acquire_owner
+      ProcessOwner.new(@path, SecureRandom.uuid)
+    end
+
+    def start_process(component:, at: Time.now, owner: nil)
       return failure unless @scope && %w[web job].include?(component) && timestamp(at)
-      id = SecureRandom.uuid
+      id = owner ? owner.id : SecureRandom.uuid
       execute("start", id: id, scope: @scope, component: component, at: timestamp(at))
     end
 
@@ -64,9 +69,19 @@ module RetainedLogging
       execute("finish", id: process_id, scope: @scope, at: timestamp(at))
     end
 
-    def cleanup(at: Time.now)
+    # Operator-supplied upper bound after independently confirming owner exit.
+    # Needed for legacy records that predate the process ownership lock.
+    def reconcile_process(process_id:, stopped_at:, at: Time.now)
+      return failure unless valid_id?(process_id) && timestamp(stopped_at) && timestamp(at) && stopped_at <= at
+      execute("reconcile", id: process_id, scope: @scope, at: timestamp(stopped_at))
+    end
+
+    def cleanup(at: nil)
+      clock = Time.now
+      at ||= clock
       return failure unless timestamp(at)
-      execute("cleanup", cutoff: timestamp(at) - RETENTION_SECONDS * 1_000_000, limit: CLEANUP_BATCH_SIZE)
+      execute("cleanup", scope: @scope, at: timestamp(at), clock_offset: timestamp(at) - timestamp(clock),
+        cutoff: timestamp(at) - RETENTION_SECONDS * 1_000_000, limit: CLEANUP_BATCH_SIZE)
     end
 
     # Only RetainedLogs supplies this internal query; no client-controlled path or SQL.

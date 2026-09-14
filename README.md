@@ -115,6 +115,28 @@ unfinished worker pool invalidates that interval. Ruby's `at_exit` closes normal
 lifecycles; its handler is registered before application initializers so their exit
 logging runs first. Hard exits leave an unverified tail.
 
+Each collector holds a file lock beside the history database, in `<database>.owners/`.
+All containers must share this directory and support POSIX file locks on the shared filesystem.
+The existing cleanup job closes abandoned lifecycles only after it acquires their released locks.
+Closure uses the observation time, so the interval after the last checkpoint remains a gap.
+A live but stalled collector keeps its lock and remains incomplete.
+Forked children close inherited descriptors without unlocking the parent's descriptor.
+Storage workers do not inherit locks across `exec`.
+Cleanup removes lock files when it removes their expired process records.
+
+Legacy lifecycles have no lock files and require independent evidence that their owners stopped.
+The operator task accepts one process UUID and a conservative UTC upper bound for its stop time:
+
+```sh
+RAILS_ENV=production bin/rails 'retained_logging:reconcile[PROCESS_UUID,2026-09-14T18:00:00Z]'
+```
+
+After you confirm the owner stopped, replace both example arguments with the corresponding evidence.
+Do not use the last checkpoint as proof of process termination.
+The task rejects future times, bounds before retained events or checkpoints, and owners with active locks.
+It preserves existing completions and never creates captured intervals.
+No schema migration is required for ownership locks or reconciliation.
+
 Puma requires the single plugin declaration because its launcher controls fork and
 restart hooks outside Rails boot. The plugin ends preloaded collection before
 forking, restarts child collection, and finalizes before hot restart's `exec`.

@@ -2,6 +2,7 @@
 require "sqlite3"
 require "json"
 require_relative "history_summary"
+require_relative "process_owner"
 
 module RetainedLogging
   module HistoryWorker
@@ -64,6 +65,12 @@ module RetainedLogging
       transaction(db) do
         case operation
         when "start"
+          existing = db.get_first_row("SELECT scope, component, started_at, ended_at FROM processes WHERE id = ?", [ request.fetch("id") ])
+          if existing
+            return { outcome: "invalid_input" } unless existing[0] == request.fetch("scope") &&
+              existing[1] == request.fetch("component") && existing[2] <= request.fetch("at") && existing[3].nil?
+            return { outcome: "ok", process_id: request.fetch("id"), started_at: existing[2] }
+          end
           db.execute("INSERT INTO processes(id, scope, component, started_at) VALUES (?, ?, ?, ?)",
             request.values_at("id", "scope", "component", "at"))
           { outcome: "ok", process_id: request.fetch("id") }
@@ -97,7 +104,17 @@ module RetainedLogging
             end
           end
           { outcome: "ok" }
+        when "reconcile"
+          process = db.get_first_row("SELECT started_at, ended_at FROM processes WHERE id = ? AND scope = ?", request.values_at("id", "scope"))
+          return { outcome: "invalid_input" } unless process && request.fetch("at") >= process[0]
+          return { outcome: "ok" } if process[1]
+          result = { outcome: "contention" }
+          ProcessOwner.with_abandoned(request.fetch("database"), request.fetch("id"), legacy: true) do
+            result = complete_abandoned(db, request.fetch("id"), request.fetch("at"))
+          end
+          result
         when "cleanup"
+          reconciled = reconcile_abandoned(db, request)
           binds = request.values_at("cutoff", "limit")
           db.execute("DELETE FROM events WHERE id IN (SELECT id FROM events WHERE occurred_at < ? ORDER BY occurred_at, id LIMIT ?)", binds)
           events = db.changes
@@ -105,18 +122,61 @@ module RetainedLogging
           checkpoints = db.changes
           # Keep process identity/start/end for every retained event or interval, including
           # intervals that cross the cutoff. Stale, empty processes certify no coverage.
-          db.execute(<<~SQL, binds)
-            DELETE FROM processes WHERE id IN (
-              SELECT id FROM processes WHERE started_at < ?
+          processes = 0
+          db.execute(<<~SQL, [ request.fetch("cutoff"), request.fetch("cutoff"), request.fetch("limit") ]).each do |id, ended|
+              SELECT id, ended_at FROM processes WHERE started_at < ?
+              AND (ended_at IS NULL OR ended_at < ?)
               AND NOT EXISTS (SELECT 1 FROM events WHERE process_id = processes.id)
               AND NOT EXISTS (SELECT 1 FROM checkpoints WHERE process_id = processes.id)
-              LIMIT ?)
+              LIMIT ?
           SQL
-          { outcome: "ok", events_deleted: events, checkpoints_deleted: checkpoints, processes_deleted: db.changes }
+            owner_path = ProcessOwner.path(request.fetch("database"), id)
+            # Cleanup must not erase a stalled, still-owned process identity.
+            # Recent completions also retain their uncheckpointed gap above.
+            next if ended.nil? && File.exist?(owner_path)
+            db.execute("DELETE FROM processes WHERE id = ?", [ id ])
+            processes += db.changes
+            File.unlink(owner_path) if File.exist?(owner_path)
+          end
+          { outcome: "ok", events_deleted: events, checkpoints_deleted: checkpoints, processes_deleted: processes,
+            processes_reconciled: reconciled }
         else
           { outcome: "invalid_input" }
         end
       end
+    end
+
+    def self.reconcile_abandoned(db, request)
+      reconciled = 0
+      # Keep the existing cleanup transaction and worker deadline. A live owner
+      # is skipped immediately, even if it has not checkpointed for hours.
+      db.execute(<<~SQL, [ request.fetch("scope"), request.fetch("at"), request.fetch("limit") ]).each do |id, _|
+        SELECT id FROM processes WHERE scope = ? AND ended_at IS NULL AND started_at <= ?
+        ORDER BY sequence LIMIT ?
+      SQL
+        ProcessOwner.with_abandoned(request.fetch("database"), id) do
+          # An owner can exit while cleanup starts its worker. Use the time of
+          # the lock observation, not the earlier request time. The offset keeps
+          # an explicitly supplied maintenance clock consistent across processes.
+          observed_at = [ request.fetch("at"), (Time.now.to_r * 1_000_000).to_i + request.fetch("clock_offset") ].max
+          reconciled += 1 if complete_abandoned(db, id, observed_at)[:outcome] == "ok"
+        end
+      end
+      reconciled
+    end
+
+    def self.complete_abandoned(db, id, at)
+      latest = db.get_first_value(<<~SQL, [ id, id ])
+        SELECT MAX(at) FROM (
+          SELECT MAX(ends_at) AS at FROM checkpoints WHERE process_id = ?
+          UNION ALL SELECT MAX(occurred_at) AS at FROM events WHERE process_id = ?)
+      SQL
+      return { outcome: "invalid_input" } if latest && latest > at
+      # Observation time is a conservative upper bound, not the last good
+      # checkpoint. The unobserved interval remains a gap in summaries.
+      db.execute("INSERT INTO completions(process_id, ended_at) VALUES (?, ?)", [ id, at ])
+      db.execute("UPDATE processes SET ended_at = ? WHERE id = ?", [ at, id ])
+      { outcome: "ok" }
     end
   end
 end

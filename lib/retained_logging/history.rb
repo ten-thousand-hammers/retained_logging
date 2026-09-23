@@ -71,7 +71,8 @@ module RetainedLogging
       pattern, sample = if label && LABELS.include?(label)
         [ "label:v1:#{label}", nil ]
       elsif label.nil? && @key && message.is_a?(String) && message.valid_encoding? && message.bytesize <= 65_536
-        [ fingerprint("pattern", normalize(message)), clip(message, SAMPLE_BYTES) ]
+        text = utf8(message)
+        [ fingerprint("pattern", normalize(text)), clip(text, SAMPLE_BYTES) ]
       end
       return unless pattern
       { "occurred_at" => timestamp(at), "category" => category, "status" => status,
@@ -145,11 +146,18 @@ module RetainedLogging
       message.gsub(VARIABLE_TEXT) { "<#{Regexp.last_match.named_captures.compact.keys.first}>" }
     end
 
+    # Storage and every response are UTF-8, so text in another encoding converts
+    # before it is normalized or sampled: the same characters must fingerprint as
+    # one group whichever encoding the emitting logger handed over. The caller's
+    # size limit applies to the text it supplied, ahead of this conversion.
+    def utf8(text)
+      return text if text.encoding == Encoding::UTF_8
+      text.encode(Encoding::UTF_8, invalid: :replace, undef: :replace)
+    end
+
     # A fixed byte bound can split a multi-byte character, and an invalid string
     # would fail JSON generation for a whole page, so the partial tail goes.
-    # Storage and every response are UTF-8, so another encoding converts first.
     def clip(text, bytes)
-      text = text.encode(Encoding::UTF_8, invalid: :replace, undef: :replace) unless text.encoding == Encoding::UTF_8
       text = text.byteslice(0, bytes)
       text = text.byteslice(0, text.bytesize - 1) until text.empty? || text.valid_encoding?
       text

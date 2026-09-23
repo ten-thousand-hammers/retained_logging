@@ -6,8 +6,28 @@ require_relative "process_owner"
 
 module RetainedLogging
   module HistoryWorker
+    SCHEMA_VERSION = 3
+    SIDECAR_SUFFIXES = [ "", "-wal", "-shm", "-journal" ].freeze
+
     def self.run
       request = JSON.parse($stdin.read)
+      if request.fetch("operation") == "prepare"
+        with_preparation_lock(request.fetch("database")) do
+          discard_obsolete(request.fetch("database"))
+          open_store(request)
+        end
+      else
+        open_store(request)
+      end
+    rescue SQLite3::BusyException, SQLite3::LockedException
+      $stdout.write('{"outcome":"contention"}')
+    rescue SQLite3::FullException
+      $stdout.write('{"outcome":"capacity"}')
+    rescue StandardError
+      $stdout.write('{"outcome":"unavailable"}')
+    end
+
+    def self.open_store(request)
       flags = request.fetch("operation") == "summarize" ? SQLite3::Constants::Open::READONLY : SQLite3::Constants::Open::READWRITE
       flags |= SQLite3::Constants::Open::CREATE if request.fetch("operation") == "prepare"
       SQLite3::Database.new(request.fetch("database"), flags: flags) do |db|
@@ -17,12 +37,54 @@ module RetainedLogging
         result = perform(db, request)
         $stdout.write(JSON.generate(result))
       end
-    rescue SQLite3::BusyException, SQLite3::LockedException
-      $stdout.write('{"outcome":"contention"}')
-    rescue SQLite3::FullException
-      $stdout.write('{"outcome":"capacity"}')
-    rescue StandardError
-      $stdout.write('{"outcome":"unavailable"}')
+    end
+
+    # Inspecting the version, discarding an obsolete store and creating the new
+    # schema are one unit. Without that, a preparation that observed an obsolete
+    # version could resume after another preparation had already recreated the
+    # store and unlink records written since. The lock file is never unlinked,
+    # so every preparation excludes the others on the same inode. The parent
+    # bounds the wait: it reports a timeout and kills a worker that waits past
+    # the preparation budget, which releases the lock.
+    def self.with_preparation_lock(database)
+      File.open("#{database}.prepare", File::RDWR | File::CREAT, 0600) do |file|
+        file.close_on_exec = true
+        file.flock(File::LOCK_EX)
+        yield
+      end
+    end
+
+    # Retained history has no value across a schema change, so an obsolete store
+    # is replaced rather than migrated. The file is unlinked before it is opened,
+    # because an open handle keeps writing to the unlinked inode. The version is
+    # read under the preparation lock, so a store another preparation has already
+    # brought to the current version is left alone with its records.
+    def self.discard_obsolete(database)
+      return unless File.exist?(database)
+      version = nil
+      SQLite3::Database.new(database, flags: SQLite3::Constants::Open::READONLY) do |db|
+        version = db.get_first_value("PRAGMA user_version")
+      end
+      return if version == SCHEMA_VERSION
+      SIDECAR_SUFFIXES.each do |suffix|
+        File.unlink("#{database}#{suffix}")
+      rescue Errno::ENOENT
+        # Journal and shared-memory sidecars exist only while a writer runs.
+      end
+      discard_owners(database)
+    end
+
+    # Discarded process rows can no longer retire their own lock files, so the
+    # sweep runs here. A file whose exclusive lock is still held belongs to a
+    # live process in another container and is left in place.
+    def self.discard_owners(database)
+      Dir.children("#{database}.owners").each do |id|
+        ProcessOwner.with_abandoned(database, id) { File.unlink(ProcessOwner.path(database, id)) }
+      rescue StandardError
+        # A concurrent sweep may have removed the same abandoned file.
+      end
+    rescue Errno::ENOENT
+      # No lifecycle has ever locked this store.
     end
 
     # SQLITE_FULL may roll back automatically. The gem's transaction helper then
@@ -40,24 +102,19 @@ module RetainedLogging
       operation = request.fetch("operation")
       version = db.get_first_value("PRAGMA user_version")
       if operation == "prepare"
-        return { outcome: "unavailable" } unless [ 0, 1, 2 ].include?(version)
+        # An obsolete store was discarded before this connection opened, so only
+        # an empty new file or the current schema can reach the replay below.
+        return { outcome: "unavailable" } unless [ 0, SCHEMA_VERSION ].include?(version)
         db.execute("PRAGMA journal_mode = WAL")
-        # Rebuild the parent table without cascading deletion of retained children.
-        # Foreign keys must be disabled before opening the migration transaction.
-        db.execute("PRAGMA foreign_keys = OFF")
         transaction(db) do
           version = db.get_first_value("PRAGMA user_version")
-          raise SQLite3::Exception unless [ 0, 1, 2 ].include?(version)
-          if version == 1 && !db.table_info("processes").any? { |column| column["name"] == "sequence" }
-            db.execute_batch(File.read(File.expand_path("migrations/002_process_sequences.sql", __dir__)))
-          end
+          raise SQLite3::Exception unless [ 0, SCHEMA_VERSION ].include?(version)
           db.execute_batch(File.read(File.expand_path("schema.sql", __dir__)))
           raise SQLite3::ConstraintException unless db.execute("PRAGMA foreign_key_check").empty?
         end
-        db.execute("PRAGMA foreign_keys = ON")
         return { outcome: "ok" }
       end
-      return { outcome: "unavailable" } unless version == 2
+      return { outcome: "unavailable" } unless version == SCHEMA_VERSION
       if operation == "summarize"
         # One SQLite snapshot covers the ingestion watermark, groups and coverage.
         return db.transaction { HistorySummary.new(db, request).call }
@@ -75,8 +132,13 @@ module RetainedLogging
             request.values_at("id", "scope", "component", "at"))
           { outcome: "ok", process_id: request.fetch("id") }
         when "append", "finish"
-          process = db.get_first_row("SELECT started_at, ended_at FROM processes WHERE id = ? AND scope = ?", request.values_at("id", "scope"))
-          return { outcome: "invalid_input" } unless process && request.fetch("at") >= process[0]
+          process = db.get_first_row("SELECT started_at, ended_at, scope FROM processes WHERE id = ?", [ request.fetch("id") ])
+          # Replacing an obsolete store discards every lifecycle row. Naming that
+          # outcome lets a collector still holding one of those identities release
+          # it and register again, instead of retrying a completion against a row
+          # that no longer exists. A row held under another scope stays opaque.
+          return { outcome: "invalid_input", reason: "unknown_process" } unless process
+          return { outcome: "invalid_input" } unless process[2] == request.fetch("scope") && request.fetch("at") >= process[0]
           # A timed-out completion may have committed. Retrying it must leave the
           # original immutable completion intact so recovery can proceed.
           return { outcome: "ok" } if operation == "finish" && process[1]
@@ -97,6 +159,12 @@ module RetainedLogging
             events.each do |event|
               db.execute("INSERT INTO events(process_id, occurred_at, recorded_at, category, status, pattern) VALUES (?, ?, ?, ?, ?, ?)",
                 [ request.fetch("id"), event.fetch("occurred_at"), request.fetch("at"), *event.values_at("category", "status", "pattern") ])
+              # The first observation of an identifier keeps its sample; later
+              # occurrences leave it alone, so a group reads the same way as long
+              # as it is retained. Occurrence rows still carry no text.
+              next unless event["sample"]
+              db.execute("INSERT OR IGNORE INTO patterns(scope, pattern, sample) VALUES (?, ?, ?)",
+                [ request.fetch("scope"), event.fetch("pattern"), event.fetch("sample") ])
             end
             if checkpoint
               db.execute("INSERT INTO checkpoints(process_id, starts_at, ends_at, recorded_at, outcome, informational_count, unsupported_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -118,6 +186,17 @@ module RetainedLogging
           binds = request.values_at("cutoff", "limit")
           db.execute("DELETE FROM events WHERE id IN (SELECT id FROM events WHERE occurred_at < ? ORDER BY occurred_at, id LIMIT ?)", binds)
           events = db.changes
+          # A sample outlives neither its group nor the retention window: it goes
+          # as soon as the last retained occurrence of its identifier is deleted.
+          # Expiry above is not scope-limited, so neither is this: no sample may
+          # outlive the last retained occurrence that carries its identifier.
+          if events.positive?
+            db.execute(<<~SQL)
+              DELETE FROM patterns WHERE NOT EXISTS (
+                SELECT 1 FROM events e JOIN processes p ON p.id = e.process_id
+                WHERE e.pattern = patterns.pattern AND p.scope = patterns.scope)
+            SQL
+          end
           db.execute("DELETE FROM checkpoints WHERE id IN (SELECT id FROM checkpoints WHERE ends_at < ? ORDER BY ends_at, id LIMIT ?)", binds)
           checkpoints = db.changes
           # Keep process identity/start/end for every retained event or interval, including

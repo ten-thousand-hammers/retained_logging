@@ -150,7 +150,12 @@ module RetainedLogging
     def ensure_process(now)
       return true if @process_id
       if @abandoned_process_id
-        return false unless ok?(@history.finish_process(process_id: @abandoned_process_id, at: now))
+        completion = @history.finish_process(process_id: @abandoned_process_id, at: now)
+        # Replacing the store discards the lifecycle this collector was completing.
+        # That completion can never succeed, so release the identity and register
+        # again rather than retrying it forever. The uncertified interval stays a
+        # gap either way, because only a checkpoint certifies coverage.
+        return false unless ok?(completion) || completion["reason"] == "unknown_process"
         @abandoned_process_id = nil
         @owner&.close
         @owner = nil

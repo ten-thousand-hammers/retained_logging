@@ -155,11 +155,143 @@ class RetainedLoggingTest < Minitest::Test
       coverage = result["coverage"].first
       assert_equal "partial", coverage["availability"]
       assert_equal [ { "start" => "2026-09-11T12:00:20.000000Z", "end" => "2026-09-11T12:00:40.000000Z" } ], coverage["gaps"]
-      refute_includes result.to_s, "sentinel"
-      refute_includes File.binread(path), "sentinel"
+      # The group is readable, and the occurrence rows themselves still hold no text.
+      assert_equal "credential=sentinel\nprivate.rb:42", result["summaries"].first["sample"]
+      SQLite3::Database.new(path, readonly: true) do |db|
+        assert_empty db.execute("SELECT * FROM events").flatten.grep(/sentinel/)
+        assert_equal [ "credential=sentinel\nprivate.rb:42" ], db.execute("SELECT sample FROM patterns").flatten
+      end
       assert_includes @output.string, "failed write"
       assert_equal "ok", reopened.cleanup(at: now)["outcome"]
     end
+  end
+
+  def test_variable_text_shares_one_group_while_wording_and_fixed_labels_stay_separate
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "history.sqlite3")
+      history = RetainedLogging::History.new(path: path, scope: "test", key: "k" * 32)
+      assert_equal "ok", history.prepare["outcome"]
+      now = Time.utc(2026, 9, 11, 12)
+      id = history.start_process(component: "web", at: now).fetch("process_id")
+      pairs = [
+        [ "Search 12 timed out", "Search 3841 timed out" ],
+        [ "Digest 9f8e7d6c5b4a3210 mismatched", "Digest 0123456789abcdef mismatched" ],
+        [ "Grab 550e8400-e29b-41d4-a716-446655440000 retried", "Grab 6ba7b810-9dad-11d1-80b4-00c04fd430c8 retried" ],
+        [ "Indexer answered in 250ms", "Indexer answered in 4.5 seconds" ],
+        [ "Import failed for /srv/media/one.mkv", "Import failed for /var/lib/grabarr/two-copy.mkv" ],
+        [ "Queue drained 9999999 records", "Queue drained 10000000 records" ],
+        [ "Copy failed for /srv/media/café.mkv", "Copy failed for /srv/media/été.mkv" ],
+        [ %(Move failed for "/srv/media/First Film.mkv" now), %(Move failed for "/srv/media/Second Movie.mkv" now) ]
+      ]
+      events = pairs.flatten.map { |message| history.event(at: now, category: "warnings", message: message) }
+      patterns = events.map { |event| event.fetch("pattern") }
+      assert_equal 8, patterns.uniq.size
+      assert_equal patterns.each_slice(2).map(&:uniq).map(&:size), [ 1 ] * 8
+      failed = history.event(at: now, category: "failed_requests", status: 503, label: "failed_request",
+        message: "Completed 503 Service Unavailable in 7ms")
+      assert_equal "label:v1:failed_request", failed["pattern"]
+      assert_equal "ok", history.append(process_id: id, events: events + [ failed ], at: now)["outcome"]
+      result = RetainedLogging::RetainedLogs.new(history: history, now: now + 1).call("component" => "web", "lookback_minutes" => 1)
+      assert_equal 9, result["total_groups"]
+      assert_equal [ 1 ] + [ 2 ] * 8, result["summaries"].map { |group| group["count"] }.sort
+      assert_equal [ 503 ], result["summaries"].filter_map { |group| group["status"] }
+    end
+  end
+
+  def test_sample_keeps_the_first_message_is_bounded_and_expires_with_its_group
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "history.sqlite3")
+      history = RetainedLogging::History.new(path: path, scope: "test", key: "k" * 32)
+      assert_equal "ok", history.prepare["outcome"]
+      now = Time.utc(2026, 9, 11, 12)
+      id = history.start_process(component: "web", at: now).fetch("process_id")
+      # A multi-byte character straddles the 512 byte bound of the long message.
+      long = "Import failed for #{'a' * 493}é tail"
+      events = [ history.event(at: now, category: "warnings", message: "Import failed for /srv/one.mkv"),
+        history.event(at: now, category: "warnings", message: "Import failed for /srv/two.mkv"),
+        history.event(at: now, category: "warnings", message: long) ]
+      assert_equal "Import failed for /srv/one.mkv", events.first["sample"]
+      # The bound falls inside the multi-byte character, which is dropped whole.
+      assert_equal 511, events.last["sample"].bytesize
+      assert events.last["sample"].valid_encoding?
+      assert_equal "ok", history.append(process_id: id, events: events, at: now)["outcome"]
+      result = RetainedLogging::RetainedLogs.new(history: history, now: now + 1).call("lookback_minutes" => 1)
+      assert_equal 2, result["total_groups"]
+      grouped = result["summaries"].find { |group| group["count"] == 2 }
+      assert_equal "Import failed for /srv/one.mkv", grouped["sample"]
+      assert_equal events.last["sample"], result["summaries"].find { |group| group["count"] == 1 }["sample"]
+      # An oversized or mistyped sample never reaches the worker.
+      [ "x" * 513, 42, nil ].each do |sample|
+        assert_equal "invalid_input", history.append(process_id: id, events: [ events.first.merge("sample" => sample) ], at: now)["outcome"]
+      end
+      assert_equal 2, sample_rows(path).size
+      assert_equal "ok", history.cleanup(at: now + 49 * 60 * 60)["outcome"]
+      assert_empty sample_rows(path)
+    end
+  end
+
+  def test_obsolete_store_is_discarded_with_its_abandoned_locks_while_a_live_lock_survives
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "history.sqlite3")
+      history = RetainedLogging::History.new(path: path, scope: "test", key: "k" * 32)
+      assert_equal "ok", history.prepare["outcome"]
+      now = Time.utc(2026, 9, 11, 12)
+      abandoned = history.acquire_owner
+      history.start_process(component: "web", at: now, owner: abandoned)
+      abandoned.close
+      live = history.acquire_owner
+      history.start_process(component: "job", at: now, owner: live)
+      # A store left at an earlier schema version is replaced, not migrated.
+      SQLite3::Database.new(path) { |db| db.execute("PRAGMA user_version = 2") }
+      assert_equal "ok", history.prepare["outcome"]
+      SQLite3::Database.new(path, readonly: true) do |db|
+        assert_equal 3, db.get_first_value("PRAGMA user_version")
+        assert_equal 0, db.get_first_value("SELECT COUNT(*) FROM processes")
+      end
+      refute File.exist?(RetainedLogging::ProcessOwner.path(path, abandoned.id))
+      assert File.exist?(RetainedLogging::ProcessOwner.path(path, live.id))
+      # The recreated store immediately accepts records and serves reads.
+      id = history.start_process(component: "web", at: now).fetch("process_id")
+      event = history.event(at: now, category: "warnings", message: "Import failed for /srv/one.mkv")
+      assert_equal "ok", history.append(process_id: id, events: [ event ], at: now)["outcome"]
+      result = RetainedLogging::RetainedLogs.new(history: history, now: now + 1).call("lookback_minutes" => 1)
+      assert_equal [ "Import failed for /srv/one.mkv" ], result["summaries"].map { |group| group["sample"] }
+      # A store already at the current version keeps its records.
+      assert_equal "ok", history.prepare["outcome"]
+      assert_equal 1, RetainedLogging::RetainedLogs.new(history: history, now: now + 1).call("lookback_minutes" => 1)["total_groups"]
+    ensure
+      live&.close
+    end
+  end
+
+  def test_a_full_page_of_maximum_samples_is_returned_rather_than_refused
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "history.sqlite3")
+      history = RetainedLogging::History.new(path: path, scope: "test", key: "k" * 32)
+      assert_equal "ok", history.prepare["outcome"]
+      now = Time.utc(2026, 9, 11, 12)
+      id = history.start_process(component: "web", at: now).fetch("process_id")
+      # Worst case escaping: a control character costs six response bytes each.
+      events = 100.times.map do |index|
+        history.event(at: now, category: "warnings",
+          message: "condition #{index.to_s(26).tr('0-9a-p', 'a-z')} #{"\u0001" * 480}")
+      end
+      assert events.all? { |event| event["sample"].bytesize > 480 }
+      assert_equal "ok", history.append(process_id: id, events: events, at: now)["outcome"]
+      result = RetainedLogging::RetainedLogs.new(history: history, now: now + 1).call("lookback_minutes" => 1, "limit" => 100)
+      assert_equal 100, result["total_groups"]
+      assert_equal 100, result["summaries"].size
+      refute result["truncated"]
+      assert result["summaries"].all? { |group| group["sample"].valid_encoding? && group["sample"].start_with?("condition ") }
+      # Each sample is shortened to a valid prefix rather than failing the page.
+      assert result["summaries"].all? { |group| events.any? { |event| event["sample"].start_with?(group["sample"]) } }
+      assert result["summaries"].all? { |group| events.none? { |event| event["sample"] == group["sample"] } }
+      assert_operator JSON.generate(result).bytesize, :<, RetainedLogging::History::READ_RESPONSE_BYTES
+    end
+  end
+
+  def sample_rows(path)
+    SQLite3::Database.new(path, readonly: true) { |db| return db.execute("SELECT scope, pattern, sample FROM patterns") }
   end
 
   def test_built_package_runs_storage_worker_and_summary_without_host_boot_or_paths

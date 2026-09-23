@@ -1,9 +1,12 @@
 # Retained logging
 
-An in-repository Bundler path gem for safe application evidence. It retains bounded
+An in-repository Bundler path gem for bounded application evidence. It retains bounded
 metadata and keyed pattern identifiers in SQLite for 48 hours, with checkpoints
-that distinguish captured silence from missing collection. It retains no raw text,
-credentials, parameters, or stack traces.
+that distinguish captured silence from missing collection.
+An identifier is a keyed fingerprint of the normalized message, and each identifier also retains one readable sample of the original message text, clipped to 512 bytes on a whole-character boundary.
+The sample comes from the first message that produced the identifier and is never overwritten; cleanup deletes it once no retained occurrence carries that identifier, so it does not outlive the 48 hour window.
+Anyone who can read the database file or the host's read surface can read that text, so the host controls access to both.
+Nothing else is retained: URLs, parameters, credentials and stack traces have no columns of their own and reach storage only inside a captured message.
 
 ```ruby
 require "retained_logging"
@@ -37,14 +40,17 @@ lifecycle hooks; Rails callers can use the bundled integration below.
 History creation is explicit; ordinary writes and reads never prepare the schema.
 Capture writes and cleanup have a one-second worker budget; reads have an
 eight-second budget. Explicit schema preparation has a separate ten-second budget
-for schema creation and migration on durable storage. It never runs during capture
+for schema creation on durable storage. It never runs during capture
 or an inspection request.
 Checkpoint finalization serializes capture admission and failure accounting with
 persistence. Logging can wait for finalization (up to three writes during recovery,
 or four when stopping). Ordinary event-write contention still fails open and marks
 a gap. A contended or failed stop remains retryable; lifecycle-lock retries last
-at most one second. Preparation preserves non-reusable process registration
-sequences used by paginated coverage, including after cleanup.
+at most one second.
+Preparing a store already at the current schema version preserves its records, samples and non-reusable process registration sequences, including after cleanup.
+Preparing an absent store creates it empty at that version.
+Preparing a store at any other version discards it, recreates it empty and sweeps the lock files of the discarded records, leaving in place any lock a running process still holds; there is no migration path, so a schema version change empties the store.
+A collector running through that replacement registers a new lifecycle on its next write instead of retrying a completion for the discarded one, and the interval it left uncertified stays a gap.
 Failures return fixed outcomes and collection records gaps without raising into
 normal logging. Raw output through `<<` lacks severity metadata and invalidates
 coverage. Output that bypasses the application logger is outside this guarantee.
@@ -135,7 +141,7 @@ After you confirm the owner stopped, replace both example arguments with the cor
 Do not use the last checkpoint as proof of process termination.
 The task rejects future times, bounds before retained events or checkpoints, and owners with active locks.
 It preserves existing completions and never creates captured intervals.
-No schema migration is required for ownership locks or reconciliation.
+The gem has no migration mechanism; a store at an unexpected schema version is replaced rather than migrated.
 
 Puma requires the single plugin declaration because its launcher controls fork and
 restart hooks outside Rails boot. The plugin ends preloaded collection before

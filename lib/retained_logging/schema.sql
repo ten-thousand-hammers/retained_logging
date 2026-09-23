@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_window ON events(occurred_at, id);
 CREATE INDEX IF NOT EXISTS events_process ON events(process_id);
+CREATE INDEX IF NOT EXISTS events_pattern ON events(pattern);
 CREATE TABLE IF NOT EXISTS checkpoints (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   process_id TEXT NOT NULL REFERENCES processes(id),
@@ -35,4 +36,13 @@ CREATE TABLE IF NOT EXISTS completions (
   process_id TEXT NOT NULL UNIQUE REFERENCES processes(id) ON DELETE CASCADE,
   ended_at INTEGER NOT NULL
 );
-PRAGMA user_version = 2;
+-- One bounded sample of the first message that produced each identifier. The
+-- sample is readable, so retention and the cleanup of orphaned rows below are
+-- what keep it inside the 48 hour window.
+CREATE TABLE IF NOT EXISTS patterns (
+  scope TEXT NOT NULL,
+  pattern TEXT NOT NULL CHECK (length(pattern) <= 80),
+  sample TEXT NOT NULL CHECK (length(CAST(sample AS BLOB)) <= 512),
+  PRIMARY KEY (scope, pattern)
+) WITHOUT ROWID;
+PRAGMA user_version = 3;

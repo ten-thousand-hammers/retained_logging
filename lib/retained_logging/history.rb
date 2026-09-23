@@ -15,7 +15,27 @@ module RetainedLogging
     READ_RESPONSE_BYTES = 240 * 1024
     BATCH_SIZE = 100
     CLEANUP_BATCH_SIZE = 1000
+    SAMPLE_BYTES = 512
     LABELS = %w[application_error application_warning failed_request].freeze
+    # Occurrence-specific text splits one condition across many identifiers, so a fixed
+    # set of variable classes collapses before the message is fingerprinted. Every branch
+    # is atomic and every quantifier is bounded by one token, so matching is a single
+    # left-to-right pass that cannot backtrack into a variable run, over text the caller
+    # has already capped at 64 KiB. A path component accepts any word character so a
+    # non-ASCII filename collapses whole, and a quoted path may hold spaces; the quotes
+    # themselves stay outside the match so surrounding wording keeps its shape. A digits-only
+    # run is a number at every length, so only a run carrying a hexadecimal letter is a hex run.
+    VARIABLE_TEXT = /
+      (?<uuid>\b\h{8}-\h{4}-\h{4}-\h{4}-\h{12}\b)
+      | (?<duration>\b(?>\d+)(?:\.(?>\d+))?[ ]?(?:ms|ns|us|millisecond|second|minute|hour|day|s|m|h)s?\b)
+      | (?<path>
+          (?<=")(?>\/[^"\n]*+)(?=")
+          | (?<=')(?>\/[^'\n]*+)(?=')
+          | (?<![[:word:]])(?>(?:\/[[:word:].+@%~-]+)+)\/?
+        )
+      | (?<hex>\b(?:0x(?>\h+)|(?!(?>\d+)\b)(?>\h{8,}))\b)
+      | (?<number>\b(?>\d+)(?:\.(?>\d+))?\b)
+    /x
     OUTCOMES = %w[ok invalid_input unavailable contention capacity timeout].freeze
     WORKER_LOAD_PATH = %w[sqlite3 json time date].flat_map do |name|
       Gem::Specification.find_by_name(name).full_require_paths
@@ -41,18 +61,22 @@ module RetainedLogging
       execute("start", id: id, scope: @scope, component: component, at: timestamp(at))
     end
 
-    # Raw text is fingerprinted here and never sent to the persistence worker.
+    # Normalized text is fingerprinted here, and the original text accompanies it
+    # as a bounded sample so a reported group can be read. A fixed label carries
+    # no sample: its wording is already the label.
     def event(at:, category:, message: nil, label: nil, status: nil)
       return unless timestamp(at) && %w[errors warnings failed_requests].include?(category)
       return unless status.nil? || (status.is_a?(Integer) && (400..599).cover?(status))
       return unless (category == "failed_requests") == !status.nil?
-      pattern = if label && LABELS.include?(label)
-        "label:v1:#{label}"
-      elsif label.nil? && @key && message.is_a?(String) && message.bytesize <= 65_536
-        fingerprint("pattern", message)
+      pattern, sample = if label && LABELS.include?(label)
+        [ "label:v1:#{label}", nil ]
+      elsif label.nil? && @key && message.is_a?(String) && message.valid_encoding? && message.bytesize <= 65_536
+        text = utf8(message)
+        [ fingerprint("pattern", normalize(text)), clip(text, SAMPLE_BYTES) ]
       end
       return unless pattern
-      { "occurred_at" => timestamp(at), "category" => category, "status" => status, "pattern" => pattern }
+      { "occurred_at" => timestamp(at), "category" => category, "status" => status,
+        "pattern" => pattern, "sample" => sample }
     end
 
     # A checkpoint certifies only its explicit interval. Gaps are never filled by storage.
@@ -116,6 +140,29 @@ module RetainedLogging
       (value.to_r * 1_000_000).to_i if value.is_a?(Time) && value.to_i.between?(0, 32_503_680_000)
     end
 
+    # Occurrences of one condition differ only in their variable text, so two messages
+    # group together exactly when the wording around that text is identical.
+    def normalize(message)
+      message.gsub(VARIABLE_TEXT) { "<#{Regexp.last_match.named_captures.compact.keys.first}>" }
+    end
+
+    # Storage and every response are UTF-8, so text in another encoding converts
+    # before it is normalized or sampled: the same characters must fingerprint as
+    # one group whichever encoding the emitting logger handed over. The caller's
+    # size limit applies to the text it supplied, ahead of this conversion.
+    def utf8(text)
+      return text if text.encoding == Encoding::UTF_8
+      text.encode(Encoding::UTF_8, invalid: :replace, undef: :replace)
+    end
+
+    # A fixed byte bound can split a multi-byte character, and an invalid string
+    # would fail JSON generation for a whole page, so the partial tail goes.
+    def clip(text, bytes)
+      text = text.byteslice(0, bytes)
+      text = text.byteslice(0, text.bytesize - 1) until text.empty? || text.valid_encoding?
+      text
+    end
+
     def fingerprint(kind, value)
       "hmac:v1:#{OpenSSL::HMAC.hexdigest('SHA256', @key, "#{kind}\0#{value}")}"
     end
@@ -129,12 +176,20 @@ module RetainedLogging
     end
 
     def valid_event?(value)
-      return false unless value.is_a?(Hash) && value.keys.sort == %w[category occurred_at pattern status]
+      return false unless value.is_a?(Hash) && value.keys.sort == %w[category occurred_at pattern sample status]
       return false unless valid_time?(value["occurred_at"]) && %w[errors warnings failed_requests].include?(value["category"])
       status = value["status"]
       return false unless value["category"] == "failed_requests" ? status.is_a?(Integer) && (400..599).cover?(status) : status.nil?
-      pattern = value["pattern"]
-      pattern.is_a?(String) && (LABELS.any? { |label| pattern == "label:v1:#{label}" } || pattern.match?(/\Ahmac:v1:[0-9a-f]{64}\z/))
+      pattern, sample = value.values_at("pattern", "sample")
+      return false unless pattern.is_a?(String)
+      # Nothing unbounded reaches the worker: a fingerprinted group carries one
+      # bounded sample, and a fixed label carries none.
+      if LABELS.any? { |label| pattern == "label:v1:#{label}" }
+        sample.nil?
+      else
+        pattern.match?(/\Ahmac:v1:[0-9a-f]{64}\z/) && sample.is_a?(String) &&
+          sample.encoding == Encoding::UTF_8 && sample.valid_encoding? && sample.bytesize <= SAMPLE_BYTES
+      end
     end
 
     def valid_checkpoint?(value)

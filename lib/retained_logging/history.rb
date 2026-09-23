@@ -18,13 +18,21 @@ module RetainedLogging
     LABELS = %w[application_error application_warning failed_request].freeze
     # Occurrence-specific text splits one condition across many identifiers, so a fixed
     # set of variable classes collapses before the message is fingerprinted. Every branch
-    # is ASCII-only and atomic, so matching is a single left-to-right pass that cannot
-    # backtrack into a variable run, over text the caller has already capped at 64 KiB.
+    # is atomic and every quantifier is bounded by one token, so matching is a single
+    # left-to-right pass that cannot backtrack into a variable run, over text the caller
+    # has already capped at 64 KiB. A path component accepts any word character so a
+    # non-ASCII filename collapses whole, and a quoted path may hold spaces; the quotes
+    # themselves stay outside the match so surrounding wording keeps its shape. A digits-only
+    # run is a number at every length, so only a run carrying a hexadecimal letter is a hex run.
     VARIABLE_TEXT = /
       (?<uuid>\b\h{8}-\h{4}-\h{4}-\h{4}-\h{12}\b)
       | (?<duration>\b(?>\d+)(?:\.(?>\d+))?[ ]?(?:ms|ns|us|millisecond|second|minute|hour|day|s|m|h)s?\b)
-      | (?<path>(?<!\w)(?>(?:\/[\w.+@-]+)+)\/?)
-      | (?<hex>\b(?:0x)?(?>\h{8,})\b)
+      | (?<path>
+          (?<=")(?>\/[^"\n]*+)(?=")
+          | (?<=')(?>\/[^'\n]*+)(?=')
+          | (?<![[:word:]])(?>(?:\/[[:word:].+@%~-]+)+)\/?
+        )
+      | (?<hex>\b(?:0x(?>\h+)|(?!(?>\d+)\b)(?>\h{8,}))\b)
       | (?<number>\b(?>\d+)(?:\.(?>\d+))?\b)
     /x
     OUTCOMES = %w[ok invalid_input unavailable contention capacity timeout].freeze

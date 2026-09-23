@@ -174,19 +174,22 @@ class RetainedLoggingTest < Minitest::Test
         [ "Digest 9f8e7d6c5b4a3210 mismatched", "Digest 0123456789abcdef mismatched" ],
         [ "Grab 550e8400-e29b-41d4-a716-446655440000 retried", "Grab 6ba7b810-9dad-11d1-80b4-00c04fd430c8 retried" ],
         [ "Indexer answered in 250ms", "Indexer answered in 4.5 seconds" ],
-        [ "Import failed for /srv/media/one.mkv", "Import failed for /var/lib/grabarr/two-copy.mkv" ]
+        [ "Import failed for /srv/media/one.mkv", "Import failed for /var/lib/grabarr/two-copy.mkv" ],
+        [ "Queue drained 9999999 records", "Queue drained 10000000 records" ],
+        [ "Copy failed for /srv/media/café.mkv", "Copy failed for /srv/media/été.mkv" ],
+        [ %(Move failed for "/srv/media/First Film.mkv" now), %(Move failed for "/srv/media/Second Movie.mkv" now) ]
       ]
       events = pairs.flatten.map { |message| history.event(at: now, category: "warnings", message: message) }
       patterns = events.map { |event| event.fetch("pattern") }
-      assert_equal 5, patterns.uniq.size
-      assert_equal patterns.each_slice(2).map(&:uniq).map(&:size), [ 1 ] * 5
+      assert_equal 8, patterns.uniq.size
+      assert_equal patterns.each_slice(2).map(&:uniq).map(&:size), [ 1 ] * 8
       failed = history.event(at: now, category: "failed_requests", status: 503, label: "failed_request",
         message: "Completed 503 Service Unavailable in 7ms")
       assert_equal "label:v1:failed_request", failed["pattern"]
       assert_equal "ok", history.append(process_id: id, events: events + [ failed ], at: now)["outcome"]
       result = RetainedLogging::RetainedLogs.new(history: history, now: now + 1).call("component" => "web", "lookback_minutes" => 1)
-      assert_equal 6, result["total_groups"]
-      assert_equal [ 1, 2, 2, 2, 2, 2 ], result["summaries"].map { |group| group["count"] }.sort
+      assert_equal 9, result["total_groups"]
+      assert_equal [ 1 ] + [ 2 ] * 8, result["summaries"].map { |group| group["count"] }.sort
       assert_equal [ 503 ], result["summaries"].filter_map { |group| group["status"] }
     end
   end

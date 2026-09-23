@@ -1,4 +1,5 @@
 require "time"
+require "json"
 
 module RetainedLogging
   # Runs in the cancellable read-only history worker, never on a Rails connection.
@@ -6,6 +7,9 @@ module RetainedLogging
     DESCRIPTIONS = { "errors" => "Application error observed.", "warnings" => "Application warning observed.",
       "request_failures" => "Failed HTTP request observed." }.freeze
     MAX_INTERVALS = 200
+    # Escaping can multiply a sample's bytes, so a page shares one serialized
+    # sample allowance well inside the reader's response budget.
+    SAMPLE_RESPONSE_BYTES = 120 * 1024
 
     def initialize(db, request)
       @db, @scope, @query = db, request.fetch("scope"), request.fetch("snapshot")
@@ -29,26 +33,55 @@ module RetainedLogging
         predicates << "e.category = ?"
         binds << (@selectors["category"] == "request_failures" ? "failed_requests" : @selectors["category"])
       end
+      # One patterns row exists per scope and identifier, so the join adds the
+      # sample without changing the grouping keys, the ordering or the total.
       grouped = <<~SQL
         SELECT p.component, e.category, e.status, e.pattern, COUNT(*) AS count,
-          MIN(e.occurred_at) AS first_seen, MAX(e.occurred_at) AS last_seen
+          MIN(e.occurred_at) AS first_seen, MAX(e.occurred_at) AS last_seen, MAX(s.sample) AS sample
         FROM events e JOIN processes p ON p.id = e.process_id
+        LEFT JOIN patterns s ON s.scope = p.scope AND s.pattern = e.pattern
         WHERE #{predicates.join(' AND ')}
         GROUP BY p.component, e.category, e.status, e.pattern
       SQL
       total = @db.get_first_value("SELECT COUNT(*) FROM (#{grouped})", binds)
       rows = @db.execute("#{grouped} ORDER BY p.component, e.category, e.status, e.pattern LIMIT ? OFFSET ?",
         [ *binds, @selectors.fetch("limit"), @query.fetch("offset") ])
-      summaries = rows.map do |component, category, status, pattern, count, first_seen, last_seen|
+      remaining = SAMPLE_RESPONSE_BYTES
+      summaries = rows.each_with_index.map do |(component, category, status, pattern, count, first_seen, last_seen, sample), index|
         category = "request_failures" if category == "failed_requests"
+        sample = fit(sample, remaining / (rows.size - index))
+        remaining -= serialized(sample) if sample
         { component: component, category: category, status: status, pattern: pattern, count: count,
-          first_seen: iso(first_seen), last_seen: iso(last_seen), description: DESCRIPTIONS.fetch(category) }
+          first_seen: iso(first_seen), last_seen: iso(last_seen), description: DESCRIPTIONS.fetch(category),
+          sample: sample }
       end
       { outcome: "ok", watermark: @watermark, summaries: summaries, total_groups: total,
         coverage: @components.map { |component| coverage(component) } }
     end
 
     private
+
+    # A page of maximum-length samples must return rather than exceed the
+    # reader's response budget, so a sample is shortened to a valid prefix
+    # whenever its escaped form claims more than its share of the allowance.
+    def fit(sample, allowance)
+      return if sample.nil?
+      sample = sample.scrub
+      while (escaped = serialized(sample)) > allowance && !sample.empty?
+        sample = clip(sample, [ sample.bytesize * allowance / escaped, sample.bytesize - 1 ].min)
+      end
+      sample
+    end
+
+    def serialized(sample)
+      JSON.generate([ sample ]).bytesize
+    end
+
+    def clip(text, bytes)
+      text = text.byteslice(0, [ bytes, 0 ].max)
+      text = text.byteslice(0, text.bytesize - 1) until text.empty? || text.valid_encoding?
+      text
+    end
 
     def coverage(component)
       captured, uncertain, reasons = [], [], []

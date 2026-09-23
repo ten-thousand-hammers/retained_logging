@@ -11,15 +11,13 @@ module RetainedLogging
 
     def self.run
       request = JSON.parse($stdin.read)
-      discard_obsolete(request.fetch("database")) if request.fetch("operation") == "prepare"
-      flags = request.fetch("operation") == "summarize" ? SQLite3::Constants::Open::READONLY : SQLite3::Constants::Open::READWRITE
-      flags |= SQLite3::Constants::Open::CREATE if request.fetch("operation") == "prepare"
-      SQLite3::Database.new(request.fetch("database"), flags: flags) do |db|
-        db.busy_timeout = 100
-        db.execute("PRAGMA foreign_keys = ON")
-        db.execute("PRAGMA synchronous = FULL")
-        result = perform(db, request)
-        $stdout.write(JSON.generate(result))
+      if request.fetch("operation") == "prepare"
+        with_preparation_lock(request.fetch("database")) do
+          discard_obsolete(request.fetch("database"))
+          open_store(request)
+        end
+      else
+        open_store(request)
       end
     rescue SQLite3::BusyException, SQLite3::LockedException
       $stdout.write('{"outcome":"contention"}')
@@ -29,11 +27,38 @@ module RetainedLogging
       $stdout.write('{"outcome":"unavailable"}')
     end
 
+    def self.open_store(request)
+      flags = request.fetch("operation") == "summarize" ? SQLite3::Constants::Open::READONLY : SQLite3::Constants::Open::READWRITE
+      flags |= SQLite3::Constants::Open::CREATE if request.fetch("operation") == "prepare"
+      SQLite3::Database.new(request.fetch("database"), flags: flags) do |db|
+        db.busy_timeout = 100
+        db.execute("PRAGMA foreign_keys = ON")
+        db.execute("PRAGMA synchronous = FULL")
+        result = perform(db, request)
+        $stdout.write(JSON.generate(result))
+      end
+    end
+
+    # Inspecting the version, discarding an obsolete store and creating the new
+    # schema are one unit. Without that, a preparation that observed an obsolete
+    # version could resume after another preparation had already recreated the
+    # store and unlink records written since. The lock file is never unlinked,
+    # so every preparation excludes the others on the same inode. The parent
+    # bounds the wait: it reports a timeout and kills a worker that waits past
+    # the preparation budget, which releases the lock.
+    def self.with_preparation_lock(database)
+      File.open("#{database}.prepare", File::RDWR | File::CREAT, 0600) do |file|
+        file.close_on_exec = true
+        file.flock(File::LOCK_EX)
+        yield
+      end
+    end
+
     # Retained history has no value across a schema change, so an obsolete store
     # is replaced rather than migrated. The file is unlinked before it is opened,
-    # because an open handle keeps writing to the unlinked inode. Concurrent
-    # preparations each unlink and recreate, so the visible store is always the
-    # current schema or a file another preparation is still creating.
+    # because an open handle keeps writing to the unlinked inode. The version is
+    # read under the preparation lock, so a store another preparation has already
+    # brought to the current version is left alone with its records.
     def self.discard_obsolete(database)
       return unless File.exist?(database)
       version = nil

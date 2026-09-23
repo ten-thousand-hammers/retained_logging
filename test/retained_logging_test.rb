@@ -162,6 +162,35 @@ class RetainedLoggingTest < Minitest::Test
     end
   end
 
+  def test_variable_text_shares_one_group_while_wording_and_fixed_labels_stay_separate
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "history.sqlite3")
+      history = RetainedLogging::History.new(path: path, scope: "test", key: "k" * 32)
+      assert_equal "ok", history.prepare["outcome"]
+      now = Time.utc(2026, 9, 11, 12)
+      id = history.start_process(component: "web", at: now).fetch("process_id")
+      pairs = [
+        [ "Search 12 timed out", "Search 3841 timed out" ],
+        [ "Digest 9f8e7d6c5b4a3210 mismatched", "Digest 0123456789abcdef mismatched" ],
+        [ "Grab 550e8400-e29b-41d4-a716-446655440000 retried", "Grab 6ba7b810-9dad-11d1-80b4-00c04fd430c8 retried" ],
+        [ "Indexer answered in 250ms", "Indexer answered in 4.5 seconds" ],
+        [ "Import failed for /srv/media/one.mkv", "Import failed for /var/lib/grabarr/two-copy.mkv" ]
+      ]
+      events = pairs.flatten.map { |message| history.event(at: now, category: "warnings", message: message) }
+      patterns = events.map { |event| event.fetch("pattern") }
+      assert_equal 5, patterns.uniq.size
+      assert_equal patterns.each_slice(2).map(&:uniq).map(&:size), [ 1 ] * 5
+      failed = history.event(at: now, category: "failed_requests", status: 503, label: "failed_request",
+        message: "Completed 503 Service Unavailable in 7ms")
+      assert_equal "label:v1:failed_request", failed["pattern"]
+      assert_equal "ok", history.append(process_id: id, events: events + [ failed ], at: now)["outcome"]
+      result = RetainedLogging::RetainedLogs.new(history: history, now: now + 1).call("component" => "web", "lookback_minutes" => 1)
+      assert_equal 6, result["total_groups"]
+      assert_equal [ 1, 2, 2, 2, 2, 2 ], result["summaries"].map { |group| group["count"] }.sort
+      assert_equal [ 503 ], result["summaries"].filter_map { |group| group["status"] }
+    end
+  end
+
   def test_built_package_runs_storage_worker_and_summary_without_host_boot_or_paths
     root = File.expand_path("..", __dir__)
     spec = Gem::Specification.load(File.join(root, "retained_logging.gemspec"))

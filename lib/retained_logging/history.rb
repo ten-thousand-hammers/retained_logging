@@ -16,6 +16,17 @@ module RetainedLogging
     BATCH_SIZE = 100
     CLEANUP_BATCH_SIZE = 1000
     LABELS = %w[application_error application_warning failed_request].freeze
+    # Occurrence-specific text splits one condition across many identifiers, so a fixed
+    # set of variable classes collapses before the message is fingerprinted. Every branch
+    # is ASCII-only and atomic, so matching is a single left-to-right pass that cannot
+    # backtrack into a variable run, over text the caller has already capped at 64 KiB.
+    VARIABLE_TEXT = /
+      (?<uuid>\b\h{8}-\h{4}-\h{4}-\h{4}-\h{12}\b)
+      | (?<duration>\b(?>\d+)(?:\.(?>\d+))?[ ]?(?:ms|ns|us|millisecond|second|minute|hour|day|s|m|h)s?\b)
+      | (?<path>(?<!\w)(?>(?:\/[\w.+@-]+)+)\/?)
+      | (?<hex>\b(?:0x)?(?>\h{8,})\b)
+      | (?<number>\b(?>\d+)(?:\.(?>\d+))?\b)
+    /x
     OUTCOMES = %w[ok invalid_input unavailable contention capacity timeout].freeze
     WORKER_LOAD_PATH = %w[sqlite3 json time date].flat_map do |name|
       Gem::Specification.find_by_name(name).full_require_paths
@@ -41,15 +52,15 @@ module RetainedLogging
       execute("start", id: id, scope: @scope, component: component, at: timestamp(at))
     end
 
-    # Raw text is fingerprinted here and never sent to the persistence worker.
+    # Normalized text is fingerprinted here and never sent to the persistence worker.
     def event(at:, category:, message: nil, label: nil, status: nil)
       return unless timestamp(at) && %w[errors warnings failed_requests].include?(category)
       return unless status.nil? || (status.is_a?(Integer) && (400..599).cover?(status))
       return unless (category == "failed_requests") == !status.nil?
       pattern = if label && LABELS.include?(label)
         "label:v1:#{label}"
-      elsif label.nil? && @key && message.is_a?(String) && message.bytesize <= 65_536
-        fingerprint("pattern", message)
+      elsif label.nil? && @key && message.is_a?(String) && message.valid_encoding? && message.bytesize <= 65_536
+        fingerprint("pattern", normalize(message))
       end
       return unless pattern
       { "occurred_at" => timestamp(at), "category" => category, "status" => status, "pattern" => pattern }
@@ -114,6 +125,12 @@ module RetainedLogging
 
     def timestamp(value)
       (value.to_r * 1_000_000).to_i if value.is_a?(Time) && value.to_i.between?(0, 32_503_680_000)
+    end
+
+    # Occurrences of one condition differ only in their variable text, so two messages
+    # group together exactly when the wording around that text is identical.
+    def normalize(message)
+      message.gsub(VARIABLE_TEXT) { "<#{Regexp.last_match.named_captures.compact.keys.first}>" }
     end
 
     def fingerprint(kind, value)

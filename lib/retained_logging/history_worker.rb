@@ -132,8 +132,13 @@ module RetainedLogging
             request.values_at("id", "scope", "component", "at"))
           { outcome: "ok", process_id: request.fetch("id") }
         when "append", "finish"
-          process = db.get_first_row("SELECT started_at, ended_at FROM processes WHERE id = ? AND scope = ?", request.values_at("id", "scope"))
-          return { outcome: "invalid_input" } unless process && request.fetch("at") >= process[0]
+          process = db.get_first_row("SELECT started_at, ended_at, scope FROM processes WHERE id = ?", [ request.fetch("id") ])
+          # Replacing an obsolete store discards every lifecycle row. Naming that
+          # outcome lets a collector still holding one of those identities release
+          # it and register again, instead of retrying a completion against a row
+          # that no longer exists. A row held under another scope stays opaque.
+          return { outcome: "invalid_input", reason: "unknown_process" } unless process
+          return { outcome: "invalid_input" } unless process[2] == request.fetch("scope") && request.fetch("at") >= process[0]
           # A timed-out completion may have committed. Retrying it must leave the
           # original immutable completion intact so recovery can proceed.
           return { outcome: "ok" } if operation == "finish" && process[1]

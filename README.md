@@ -50,6 +50,7 @@ at most one second.
 Preparing a store already at the current schema version preserves its records, samples and non-reusable process registration sequences, including after cleanup.
 Preparing an absent store creates it empty at that version.
 Preparing a store at any other version discards it, recreates it empty and sweeps the lock files of the discarded records, leaving in place any lock a running process still holds; there is no migration path, so a schema version change empties the store.
+A collector running through that replacement registers a new lifecycle on its next write instead of retrying a completion for the discarded one, and the interval it left uncertified stays a gap.
 Failures return fixed outcomes and collection records gaps without raising into
 normal logging. Raw output through `<<` lacks severity metadata and invalidates
 coverage. Output that bypasses the application logger is outside this guarantee.

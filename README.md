@@ -49,7 +49,9 @@ a gap. A contended or failed stop remains retryable; lifecycle-lock retries last
 at most one second.
 Preparing a store already at the current schema version preserves its records, samples and non-reusable process registration sequences, including after cleanup.
 Preparing an absent store creates it empty at that version.
-Preparing a store at any other version discards it, recreates it empty and sweeps the lock files of the discarded records, leaving in place any lock a running process still holds; there is no migration path, so a schema version change empties the store.
+Preparing a store at an upgradable version (`HistoryWorker::UPGRADABLE_VERSIONS`, currently 2) upgrades it in place and keeps its records: every change since that version only adds tables or indexes, so replaying the schema is the upgrade.
+Keep schema changes additive so retained history survives them. A change that cannot be expressed that way must remove the affected versions from that list deliberately.
+Preparing a store at any other version discards it, recreates it empty and sweeps the lock files of the discarded records, leaving in place any lock a running process still holds.
 A collector running through that replacement registers a new lifecycle on its next write instead of retrying a completion for the discarded one, and the interval it left uncertified stays a gap.
 Failures return fixed outcomes and collection records gaps without raising into
 normal logging. Raw output through `<<` lacks severity metadata and invalidates
@@ -141,7 +143,12 @@ After you confirm the owner stopped, replace both example arguments with the cor
 Do not use the last checkpoint as proof of process termination.
 The task rejects future times, bounds before retained events or checkpoints, and owners with active locks.
 It preserves existing completions and never creates captured intervals.
-The gem has no migration mechanism; a store at an unexpected schema version is replaced rather than migrated.
+Only additive schema changes upgrade in place; a store at any other unexpected schema version is replaced rather than migrated.
+
+`bin/rails 'retained_logging:verify[15]'` checks capture over a recent window (default 15 minutes, ending one minute ago).
+It fails when a component certified nothing in the window, has not checkpointed in the last minute, or saw unsupported records.
+A gap alone does not fail it, because a deployment inside the window leaves one.
+Run it a few minutes after a deployment instead of waiting for a full day of history.
 
 Puma requires the single plugin declaration because its launcher controls fork and
 restart hooks outside Rails boot. The plugin ends preloaded collection before

@@ -230,6 +230,46 @@ class RetainedLoggingTest < Minitest::Test
     end
   end
 
+  def test_verification_passes_live_capture_and_names_what_is_missing
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "history.sqlite3")
+      history = RetainedLogging::History.new(path: path, scope: "test", key: "k" * 32)
+      unprepared = RetainedLogging::Verification.new(history: history, now: Time.utc(2026, 9, 11, 12, 20)).call(minutes: 15)
+      assert_equal({ "ok" => false, "error" => "history_unavailable", "components" => [] }, unprepared)
+
+      assert_equal "ok", history.prepare["outcome"]
+      started = Time.utc(2026, 9, 11, 12)
+      micros = ->(time) { (time.to_r * 1_000_000).to_i }
+      checkpoint = lambda do |id, from, to, unsupported: 0|
+        { "starts_at" => micros.(from), "ends_at" => micros.(to), "outcome" => "captured",
+          "informational_count" => 3, "unsupported_count" => unsupported }
+      end
+      web = history.start_process(component: "web", at: started).fetch("process_id")
+      job = history.start_process(component: "job", at: started).fetch("process_id")
+      # Web checkpoints until 12:20; job stopped checkpointing at 12:10.
+      (0...120).each do |step|
+        from, to = started + step * 10, started + (step + 1) * 10
+        assert_equal "ok", history.append(process_id: web, checkpoint: checkpoint.(web, from, to), at: to)["outcome"]
+        next if to > started + 600
+        assert_equal "ok", history.append(process_id: job, checkpoint: checkpoint.(job, from, to), at: to)["outcome"]
+      end
+
+      report = RetainedLogging::Verification.new(history: history, now: started + 1205).call(minutes: 5)
+      refute report["ok"]
+      assert_equal({ "start" => "2026-09-11T12:14:05.000000Z", "end" => "2026-09-11T12:19:05.000000Z" }, report["window"])
+      web_entry, job_entry = report["components"].sort_by { |entry| entry["component"] }.reverse
+      assert_equal [ "web", true, [], 100.0 ], web_entry.values_at("component", "ok", "problems", "covered_percent")
+      assert_equal [ "job", false, %w[nothing_captured not_checkpointing], 0.0 ],
+        job_entry.values_at("component", "ok", "problems", "covered_percent")
+
+      # A longer window reaches back to the job's last captured interval.
+      report = RetainedLogging::Verification.new(history: history, now: started + 1205).call(minutes: 15)
+      job_entry = report["components"].find { |entry| entry["component"] == "job" }
+      assert_equal [ "not_checkpointing" ], job_entry["problems"]
+      assert_operator job_entry["covered_percent"], :>, 0
+    end
+  end
+
   def test_obsolete_store_is_discarded_with_its_abandoned_locks_while_a_live_lock_survives
     Dir.mktmpdir do |directory|
       path = File.join(directory, "history.sqlite3")
@@ -241,8 +281,8 @@ class RetainedLoggingTest < Minitest::Test
       abandoned.close
       live = history.acquire_owner
       history.start_process(component: "job", at: now, owner: live)
-      # A store left at an earlier schema version is replaced, not migrated.
-      SQLite3::Database.new(path) { |db| db.execute("PRAGMA user_version = 2") }
+      # A store left at a version that cannot be upgraded is replaced, not migrated.
+      SQLite3::Database.new(path) { |db| db.execute("PRAGMA user_version = 1") }
       assert_equal "ok", history.prepare["outcome"]
       SQLite3::Database.new(path, readonly: true) do |db|
         assert_equal 3, db.get_first_value("PRAGMA user_version")

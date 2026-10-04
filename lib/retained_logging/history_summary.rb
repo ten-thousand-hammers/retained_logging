@@ -1,11 +1,12 @@
 require "time"
 require "json"
+require_relative "category_names"
 
 module RetainedLogging
   # Runs in the cancellable read-only history worker, never on a Rails connection.
   class HistorySummary
     DESCRIPTIONS = { "errors" => "Application error observed.", "warnings" => "Application warning observed.",
-      "request_failures" => "Failed HTTP request observed." }.freeze
+      CategoryNames::FAILED_REQUESTS_REPORTED => "Failed HTTP request observed." }.freeze
     MAX_INTERVALS = 200
     # Escaping can multiply a sample's bytes, so a page shares one serialized
     # sample allowance well inside the reader's response budget.
@@ -31,7 +32,7 @@ module RetainedLogging
       binds = [ @scope, *@components, @retained_start, @end, @watermark.fetch("events") ]
       unless @selectors["category"] == "all"
         predicates << "e.category = ?"
-        binds << (@selectors["category"] == "request_failures" ? "failed_requests" : @selectors["category"])
+        binds << CategoryNames.stored(@selectors["category"])
       end
       # One patterns row exists per scope and identifier, so the join adds the
       # sample without changing the grouping keys, the ordering or the total.
@@ -48,7 +49,7 @@ module RetainedLogging
         [ *binds, @selectors.fetch("limit"), @query.fetch("offset") ])
       remaining = SAMPLE_RESPONSE_BYTES
       summaries = rows.each_with_index.map do |(component, category, status, pattern, count, first_seen, last_seen, sample), index|
-        category = "request_failures" if category == "failed_requests"
+        category = CategoryNames.reported(category)
         sample = fit(sample, remaining / (rows.size - index))
         remaining -= serialized(sample) if sample
         { component: component, category: category, status: status, pattern: pattern, count: count,

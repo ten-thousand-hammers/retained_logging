@@ -3,6 +3,7 @@ require "openssl"
 require "securerandom"
 require "open3"
 require "active_support/message_verifier"
+require_relative "category_names"
 require_relative "process_owner"
 
 module RetainedLogging
@@ -65,9 +66,9 @@ module RetainedLogging
     # as a bounded sample so a reported group can be read. A fixed label carries
     # no sample: its wording is already the label.
     def event(at:, category:, message: nil, label: nil, status: nil)
-      return unless timestamp(at) && %w[errors warnings failed_requests].include?(category)
+      return unless timestamp(at) && [ "errors", "warnings", CategoryNames::FAILED_REQUESTS_STORED ].include?(category)
       return unless status.nil? || (status.is_a?(Integer) && (400..599).cover?(status))
-      return unless (category == "failed_requests") == !status.nil?
+      return unless (category == CategoryNames::FAILED_REQUESTS_STORED) == !status.nil?
       pattern, sample = if label && LABELS.include?(label)
         [ "label:v1:#{label}", nil ]
       elsif label.nil? && @key && message.is_a?(String) && message.valid_encoding? && message.bytesize <= 65_536
@@ -177,9 +178,9 @@ module RetainedLogging
 
     def valid_event?(value)
       return false unless value.is_a?(Hash) && value.keys.sort == %w[category occurred_at pattern sample status]
-      return false unless valid_time?(value["occurred_at"]) && %w[errors warnings failed_requests].include?(value["category"])
+      return false unless valid_time?(value["occurred_at"]) && [ "errors", "warnings", CategoryNames::FAILED_REQUESTS_STORED ].include?(value["category"])
       status = value["status"]
-      return false unless value["category"] == "failed_requests" ? status.is_a?(Integer) && (400..599).cover?(status) : status.nil?
+      return false unless value["category"] == CategoryNames::FAILED_REQUESTS_STORED ? status.is_a?(Integer) && (400..599).cover?(status) : status.nil?
       pattern, sample = value.values_at("pattern", "sample")
       return false unless pattern.is_a?(String)
       # Nothing unbounded reaches the worker: a fingerprinted group carries one

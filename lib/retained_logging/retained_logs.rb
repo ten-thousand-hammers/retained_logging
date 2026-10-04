@@ -1,12 +1,13 @@
 require "time"
 require "date"
 require_relative "history"
+require_relative "category_names"
 require_relative "log_arguments"
 
 module RetainedLogging
   # Application history only. The MCP adapter combines platform evidence separately.
   class RetainedLogs
-    CATEGORIES = %w[errors warnings request_failures].freeze
+    CATEGORIES = [ "errors", "warnings", CategoryNames::FAILED_REQUESTS_REPORTED ].freeze
     CURSOR_SECONDS = 900
     class Error < StandardError; end
 

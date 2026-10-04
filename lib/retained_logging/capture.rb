@@ -1,5 +1,6 @@
 require "monitor"
 require_relative "history"
+require_relative "category_names"
 require_relative "broadcast_logger"
 
 module RetainedLogging
@@ -63,7 +64,7 @@ module RetainedLogging
       # A completed failed request is one signal, even when logged at ERROR.
       status = message.match(/\ACompleted ([45]\d{2})(?:\s|\z)/)&.captures&.first&.to_i
       category = if status
-        "failed_requests"
+        CategoryNames::FAILED_REQUESTS_STORED
       elsif %w[ERROR FATAL].include?(severity)
         "errors"
       elsif %w[WARN WARNING].include?(severity)

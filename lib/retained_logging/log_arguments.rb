@@ -1,10 +1,11 @@
 require "active_support/core_ext/object/deep_dup"
 require "time"
 require "date"
+require_relative "category_names"
 
 module RetainedLogging
   module LogArguments
-    CATEGORIES = %w[errors warnings request_failures deployment_signals runtime_signals].freeze
+    CATEGORIES = [ "errors", "warnings", CategoryNames::FAILED_REQUESTS_REPORTED, "deployment_signals", "runtime_signals" ].freeze
     PROPERTIES = {
       component: { type: "string", enum: %w[web job all], default: "all" },
       category: { type: "string", enum: CATEGORIES + [ "all" ], default: "all" },

@@ -7,10 +7,17 @@ require_relative "process_owner"
 module RetainedLogging
   module HistoryWorker
     SCHEMA_VERSION = 3
+    # Versions whose stores reach the current schema by replaying schema.sql,
+    # because every change since them only adds tables or indexes. Preparation
+    # keeps their records. A change that cannot be expressed that way must
+    # remove these versions deliberately, which discards their stores.
+    UPGRADABLE_VERSIONS = [ 2 ].freeze
     SIDECAR_SUFFIXES = [ "", "-wal", "-shm", "-journal" ].freeze
 
     def self.run
-      request = JSON.parse($stdin.read)
+      # History always sends UTF-8. Without a locale the default external
+      # encoding is US-ASCII, and any non-ASCII sample would fail parsing.
+      request = JSON.parse($stdin.read.force_encoding(Encoding::UTF_8))
       if request.fetch("operation") == "prepare"
         with_preparation_lock(request.fetch("database")) do
           discard_obsolete(request.fetch("database"))
@@ -54,8 +61,8 @@ module RetainedLogging
       end
     end
 
-    # Retained history has no value across a schema change, so an obsolete store
-    # is replaced rather than migrated. The file is unlinked before it is opened,
+    # A store at a version that cannot be upgraded in place is replaced rather
+    # than migrated. The file is unlinked before it is opened,
     # because an open handle keeps writing to the unlinked inode. The version is
     # read under the preparation lock, so a store another preparation has already
     # brought to the current version is left alone with its records.
@@ -65,7 +72,7 @@ module RetainedLogging
       SQLite3::Database.new(database, flags: SQLite3::Constants::Open::READONLY) do |db|
         version = db.get_first_value("PRAGMA user_version")
       end
-      return if version == SCHEMA_VERSION
+      return if version == SCHEMA_VERSION || UPGRADABLE_VERSIONS.include?(version)
       SIDECAR_SUFFIXES.each do |suffix|
         File.unlink("#{database}#{suffix}")
       rescue Errno::ENOENT
@@ -103,12 +110,14 @@ module RetainedLogging
       version = db.get_first_value("PRAGMA user_version")
       if operation == "prepare"
         # An obsolete store was discarded before this connection opened, so only
-        # an empty new file or the current schema can reach the replay below.
-        return { outcome: "unavailable" } unless [ 0, SCHEMA_VERSION ].include?(version)
+        # an empty new file, an upgradable store or the current schema can reach
+        # the replay below. Replaying the additive schema upgrades in place.
+        preparable = [ 0, *UPGRADABLE_VERSIONS, SCHEMA_VERSION ]
+        return { outcome: "unavailable" } unless preparable.include?(version)
         db.execute("PRAGMA journal_mode = WAL")
         transaction(db) do
           version = db.get_first_value("PRAGMA user_version")
-          raise SQLite3::Exception unless [ 0, SCHEMA_VERSION ].include?(version)
+          raise SQLite3::Exception unless preparable.include?(version)
           db.execute_batch(File.read(File.expand_path("schema.sql", __dir__)))
           raise SQLite3::ConstraintException unless db.execute("PRAGMA foreign_key_check").empty?
         end

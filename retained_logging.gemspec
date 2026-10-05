@@ -1,11 +1,12 @@
 Gem::Specification.new do |spec|
   spec.name = "retained_logging"
-  spec.version = "0.1.0"
+  spec.version = "0.1.1"
   spec.summary = "Bounded, private application log history and collection coverage"
   spec.authors = [ "Ten Thousand Hammers" ]
   spec.homepage = "https://github.com/ten-thousand-hammers/retained_logging"
+  spec.license = "LicenseRef-Proprietary"
   spec.required_ruby_version = ">= 3.3"
-  spec.files = Dir.chdir(__dir__) { Dir["lib/**/*", "test/**/*", "README.md"].select { |path| File.file?(path) } }
+  spec.files = Dir.chdir(__dir__) { Dir["lib/**/*", "test/**/*", "README.md", "LICENSE"].select { |path| File.file?(path) } }
   spec.require_paths = [ "lib" ]
 
   spec.add_dependency "activesupport", "~> 8.1.3", ">= 8.1.3.1"

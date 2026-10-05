@@ -76,7 +76,7 @@ or backend interface.
 ## Installation
 
 ```ruby
-gem "retained_logging", github: "ten-thousand-hammers/retained_logging", tag: "v0.1.0"
+gem "retained_logging", github: "ten-thousand-hammers/retained_logging", tag: "v0.1.1"
 ```
 
 Implement the host settings described below. Inspection transports (such as an MCP
@@ -171,3 +171,8 @@ workers in fork and async modes, and Puma in single and cluster modes, including
 preloading and hot restart. They cover
 shutdown draining, final logging, disabled capture and unfinished hard-exit tails.
 These sandbox checks do not verify production volumes or a full day of collection.
+
+## License
+
+All rights reserved. The source is visible for reference only; use requires prior
+written permission from Ten Thousand Hammers. See [LICENSE](LICENSE).

@@ -1,6 +1,6 @@
 # Times are integer microseconds since the epoch, so every adapter stores and
 # compares them identically, with no time zone or precision conversion.
-class CreateRetainedLoggingTables < ActiveRecord::Migration[8.0]
+class CreateRetainedLoggingTables < ActiveRecord::Migration[8.1]
   def change
     create_table :retained_logging_lifecycles do |t|
       t.string :uuid, null: false, limit: 36

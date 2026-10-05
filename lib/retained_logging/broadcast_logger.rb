@@ -1,5 +1,6 @@
 require "active_support/logger"
 require "active_support/broadcast_logger"
+require_relative "storing"
 
 module RetainedLogging
   # Public BroadcastLogger integration. Original destinations retain their
@@ -19,6 +20,7 @@ module RetainedLogging
 
       def add(severity, message = nil, progname = nil)
         severity ||= Logger::UNKNOWN
+        return true if RetainedLogging.storing?
         collector&.interrupt if level > Logger::INFO
         return true if severity < level || !collector
         if message.nil?

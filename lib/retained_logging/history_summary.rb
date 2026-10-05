@@ -1,9 +1,12 @@
 require "time"
 require "json"
 require_relative "category_names"
+require_relative "record"
 
 module RetainedLogging
-  # Runs in the cancellable read-only history worker, never on a Rails connection.
+  # Reads one page of grouped events and the collection coverage behind it.
+  # Every query is bounded by watermarks taken on the first page, so later
+  # pages count the same rows even while collection continues.
   class HistorySummary
     DESCRIPTIONS = { "errors" => "Application error observed.", "warnings" => "Application warning observed.",
       CategoryNames::FAILED_REQUESTS_REPORTED => "Failed HTTP request observed." }.freeze
@@ -11,9 +14,11 @@ module RetainedLogging
     # Escaping can multiply a sample's bytes, so a page shares one serialized
     # sample allowance well inside the reader's response budget.
     SAMPLE_RESPONSE_BYTES = 120 * 1024
+    GROUPING = %w[retained_logging_lifecycles.component retained_logging_events.category
+      retained_logging_events.status retained_logging_events.pattern].freeze
 
-    def initialize(db, request)
-      @db, @scope, @query = db, request.fetch("scope"), request.fetch("snapshot")
+    def initialize(scope, query)
+      @scope, @query = scope, query
       @selectors = @query.fetch("selectors")
       @start, @end = @query.values_at("start", "end")
       @retained_start = @query.fetch("retained_start")
@@ -22,31 +27,24 @@ module RetainedLogging
 
     def call
       @watermark = @query["watermark"] || {
-        "events" => @db.get_first_value("SELECT COALESCE(MAX(id), 0) FROM events"),
-        "checkpoints" => @db.get_first_value("SELECT COALESCE(MAX(id), 0) FROM checkpoints"),
-        "completions" => @db.get_first_value("SELECT COALESCE(MAX(id), 0) FROM completions"),
-        "processes" => @db.get_first_value("SELECT COALESCE(MAX(sequence), 0) FROM processes")
+        "events" => Event.maximum(:id) || 0, "checkpoints" => Checkpoint.maximum(:id) || 0,
+        "completions" => Completion.maximum(:id) || 0, "processes" => Lifecycle.maximum(:id) || 0
       }
-      predicates = [ "p.scope = ?", "p.component IN (#{([ '?' ] * @components.size).join(', ')})",
-        "e.occurred_at >= ?", "e.occurred_at < ?", "e.id <= ?" ]
-      binds = [ @scope, *@components, @retained_start, @end, @watermark.fetch("events") ]
-      unless @selectors["category"] == "all"
-        predicates << "e.category = ?"
-        binds << CategoryNames.stored(@selectors["category"])
-      end
-      # One patterns row exists per scope and identifier, so the join adds the
+      events = Event.joins(:lifecycle).where(retained_logging_lifecycles: { scope: @scope, component: @components })
+        .where(occurred_at: @retained_start...@end, id: ..@watermark.fetch("events"))
+      events = events.where(category: CategoryNames.stored(@selectors["category"])) unless @selectors["category"] == "all"
+      groups = events.group(*GROUPING)
+      total = Event.unscoped.from(groups.select(*GROUPING), :retained_groups).count
+      # One samples row exists per scope and identifier, so the join adds the
       # sample without changing the grouping keys, the ordering or the total.
-      grouped = <<~SQL
-        SELECT p.component, e.category, e.status, e.pattern, COUNT(*) AS count,
-          MIN(e.occurred_at) AS first_seen, MAX(e.occurred_at) AS last_seen, MAX(s.sample) AS sample
-        FROM events e JOIN processes p ON p.id = e.process_id
-        LEFT JOIN patterns s ON s.scope = p.scope AND s.pattern = e.pattern
-        WHERE #{predicates.join(' AND ')}
-        GROUP BY p.component, e.category, e.status, e.pattern
-      SQL
-      total = @db.get_first_value("SELECT COUNT(*) FROM (#{grouped})", binds)
-      rows = @db.execute("#{grouped} ORDER BY p.component, e.category, e.status, e.pattern LIMIT ? OFFSET ?",
-        [ *binds, @selectors.fetch("limit"), @query.fetch("offset") ])
+      samples = Sample.arel_table
+      lifecycles = Lifecycle.arel_table
+      join = Event.arel_table.join(samples, Arel::Nodes::OuterJoin)
+        .on(samples[:scope].eq(lifecycles[:scope]).and(samples[:pattern].eq(Event.arel_table[:pattern]))).join_sources
+      rows = groups.joins(join).order(*GROUPING).limit(@selectors.fetch("limit")).offset(@query.fetch("offset"))
+        .pluck(*GROUPING.map { |column| Arel.sql(column) }, Arel.sql("COUNT(*)"),
+          Arel.sql("MIN(retained_logging_events.occurred_at)"), Arel.sql("MAX(retained_logging_events.occurred_at)"),
+          Arel.sql("MAX(retained_logging_samples.sample)"))
       remaining = SAMPLE_RESPONSE_BYTES
       summaries = rows.each_with_index.map do |(component, category, status, pattern, count, first_seen, last_seen, sample), index|
         category = CategoryNames.reported(category)
@@ -87,23 +85,19 @@ module RetainedLogging
     def coverage(component)
       captured, uncertain, reasons = [], [], []
       informational = unsupported = 0
-      latest = @db.get_first_value(<<~SQL, [ @scope, component, @watermark.fetch("checkpoints") ])
-        SELECT MAX(c.ends_at) FROM checkpoints c JOIN processes p ON p.id = c.process_id
-        WHERE p.scope = ? AND p.component = ? AND c.id <= ?
-      SQL
-      processes = @db.execute(<<~SQL, [ @watermark.fetch("completions"), @scope, component, @watermark.fetch("processes"), @end, @retained_start ])
-        SELECT p.id, p.started_at, c.ended_at FROM processes p
-        LEFT JOIN completions c ON c.process_id = p.id AND c.id <= ?
-        WHERE p.scope = ? AND p.component = ? AND p.sequence <= ? AND p.started_at < ?
-          AND (c.ended_at IS NULL OR c.ended_at > ?)
-      SQL
+      lifecycles = Lifecycle.where(scope: @scope, component: component)
+      latest = Checkpoint.where(lifecycle: lifecycles, id: ..@watermark.fetch("checkpoints")).maximum(:ends_at)
+      completions = Completion.arel_table
+      join = Lifecycle.arel_table.join(completions, Arel::Nodes::OuterJoin)
+        .on(completions[:lifecycle_id].eq(Lifecycle.arel_table[:id]).and(completions[:id].lteq(@watermark.fetch("completions")))).join_sources
+      processes = lifecycles.joins(join).where(id: ..@watermark.fetch("processes"), started_at: ...@end)
+        .where(completions[:ended_at].eq(nil).or(completions[:ended_at].gt(@retained_start)))
+        .pluck(:id, :started_at, completions[:ended_at])
       processes.each do |id, started, ended|
         cursor = [ started, @retained_start ].max
         finish = [ ended || @query.fetch("as_of"), @end ].min
-        checkpoints = @db.execute(<<~SQL, [ id, @watermark.fetch("checkpoints"), @retained_start, @end ])
-          SELECT starts_at, ends_at, outcome, informational_count, unsupported_count FROM checkpoints
-          WHERE process_id = ? AND id <= ? AND ends_at >= ? AND starts_at < ? ORDER BY starts_at, id
-        SQL
+        checkpoints = Checkpoint.where(lifecycle_id: id, id: ..@watermark.fetch("checkpoints"), ends_at: @retained_start.., starts_at: ...@end)
+          .order(:starts_at, :id).pluck(:starts_at, :ends_at, :outcome, :informational_count, :unsupported_count)
         checkpoints.each do |from, to, outcome, info, unknown|
           left, right = [ from, @retained_start ].max, [ to, finish ].min
           next unless left < right

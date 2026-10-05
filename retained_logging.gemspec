@@ -3,6 +3,7 @@ Gem::Specification.new do |spec|
   spec.version = "0.1.0"
   spec.summary = "Bounded, private application log history and collection coverage"
   spec.authors = [ "Ten Thousand Hammers" ]
+  spec.homepage = "https://github.com/ten-thousand-hammers/retained_logging"
   spec.required_ruby_version = ">= 3.3"
   spec.files = Dir.chdir(__dir__) { Dir["lib/**/*", "test/**/*", "README.md"].select { |path| File.file?(path) } }
   spec.require_paths = [ "lib" ]

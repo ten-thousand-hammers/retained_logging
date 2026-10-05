@@ -1,6 +1,6 @@
 # Retained logging
 
-An in-repository Bundler path gem for bounded application evidence. It retains bounded
+A gem for bounded application evidence. It retains bounded
 metadata and keyed pattern identifiers in SQLite for 48 hours, with checkpoints
 that distinguish captured silence from missing collection.
 An identifier is a keyed fingerprint of the normalized message, and each identifier also retains one readable sample of the original message text, clipped to 512 bytes on a whole-character boundary.
@@ -64,28 +64,36 @@ of matching events and pagination. The argument contract retains the host's fixe
 platform category selectors, whose application totals are empty. Platform retrieval
 itself lives in the host and never enters retained totals.
 
-Grabarr derives the key from `Rails.application.key_generator` using
-`production_inspection/retained_history/v1`. That derivation and all environment
-settings remain outside the gem. The database schema, worker entrypoint and runtime
-requires are packaged inside the gem; no host-relative paths or Grabarr constants
-are needed. The gem depends on ActiveSupport 8.1.3.1's once-only broadcast block
+Hosts derive the key themselves, for example from `Rails.application.key_generator`
+with an application-specific salt. That derivation and all environment settings
+remain outside the gem. The database schema, worker entrypoint and runtime requires
+are packaged inside the gem; no host-relative paths or host constants are needed. The gem depends on ActiveSupport 8.1.3.1's once-only broadcast block
 semantics, sqlite3, and the declared Ruby standard gems. Workers receive only the
 load paths for the selected SQLite, JSON, time and date dependencies; they do not
 boot the host bundle or inherit Ruby preloads. It is not a new logging framework
 or backend interface.
 
-Run from the host bundle without Rails boot:
+## Installation
 
-```sh
-bin/bundle exec ruby gems/retained_logging/test/retained_logging_test.rb
+```ruby
+gem "retained_logging", github: "ten-thousand-hammers/retained_logging", tag: "v0.1.0"
 ```
 
-The tests build and extract the gem, then exercise its storage worker and summaries
-from outside the repository. To extract later, copy this directory, provide a bundle
-with its gemspec dependencies and test dependencies (`minitest`), and implement the
-host settings described below. MCP, Dokploy, Rails secrets, application scheduling,
-and deployment-volume verification remain host responsibilities. No publication
-workflow or production rollout is implied by the package tests.
+Implement the host settings described below. Inspection transports (such as an MCP
+tool), platform log sources, Rails secrets, application scheduling, and
+deployment-volume verification remain host responsibilities.
+
+## Development
+
+```sh
+bundle install
+bundle exec rake test               # unit tests, no Rails boot
+bundle exec rake test:integration   # process lifecycle tests against a disposable Rails app
+bundle exec rubocop
+```
+
+The unit tests build and extract the gem, then exercise its storage worker and
+summaries from outside the repository.
 
 ## Rails integration
 
@@ -158,7 +166,7 @@ The host needs no collector code in `bin/jobs` or its Solid Queue initializer.
 Use separately attributed web and job processes; a shared-process queue cannot
 assign different component labels to its shared logger.
 
-Grabarr's process integration tests run a disposable Rails app, real Solid Queue
+The process integration tests (`test/integration`) run a disposable Rails app, real Solid Queue
 workers in fork and async modes, and Puma in single and cluster modes, including
 preloading and hot restart. They cover
 shutdown draining, final logging, disabled capture and unfinished hard-exit tails.

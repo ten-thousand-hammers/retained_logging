@@ -1,0 +1,7 @@
+inherit_gem:
+  rubocop-rails-omakase: rubocop.yml
+
+AllCops:
+  Exclude:
+    - "test/fixtures/queue_schema.rb"
+    - "vendor/**/*"

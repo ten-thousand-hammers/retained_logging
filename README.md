@@ -17,7 +17,7 @@ storage only inside a captured message.
 ## Installation
 
 ```ruby
-gem "retained_logging", github: "ten-thousand-hammers/retained_logging", tag: "v0.2.0"
+gem "retained_logging", github: "ten-thousand-hammers/retained_logging", tag: "v0.2.1"
 ```
 
 The store is any database Active Record supports. The suite runs against SQLite

@@ -175,4 +175,5 @@ These sandbox checks do not verify production volumes or a full day of collectio
 ## License
 
 All rights reserved. The source is visible for reference only; use requires prior
-written permission from Ten Thousand Hammers. See [LICENSE](LICENSE).
+written permission from Ten Thousand Hammers. Bundled Brand has that permission for
+its own products and services. See [LICENSE](LICENSE).

@@ -20,8 +20,9 @@ class RetainedLoggingLifecycleApp < Rails::Application
   # silencing lowers the log level and the collector then rejects coverage.
   polling = ENV["LIFECYCLE_SILENCE_POLLING"].presence
   config.solid_queue.silence_polling = polling == "true" if polling
+  config.retained_logging.database = :retained_logging
   config.retained_logging.history = -> {
-    RetainedLogging::History.new(path: Rails.root.join("history.sqlite3"), scope: "lifecycle",
+    RetainedLogging::History.new(scope: "lifecycle",
       key: Rails.application.key_generator.generate_key("retained_logging/lifecycle/v1", 32))
   }
 end
@@ -42,13 +43,11 @@ when "boot"
   ActiveJob::Base.logger.warn("active job event")
   SolidQueue.logger.warn("queue event")
 when "prepare"
+  # Hosts prepare the store with Rails' own per-database task.
   Rails.application.load_tasks
-  Rake::Task["retained_logging:prepare"].invoke
+  Rake::Task["db:migrate:retained_logging"].invoke
   abort "cleanup failed" unless integration.history.cleanup.fetch("outcome") == "ok"
-when "reconcile"
-  Rails.application.load_tasks
-  id = integration.history.start_process(component: "job", at: Time.now - 60).fetch("process_id")
-  Rake::Task["retained_logging:reconcile"].invoke(id, Time.now.utc.iso8601(6))
+  puts "Retained logging prepared"
 when "verify"
   Rails.application.load_tasks
   history = integration.history

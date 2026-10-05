@@ -1,4 +1,5 @@
 require "monitor"
+require "securerandom"
 require_relative "history"
 require_relative "category_names"
 require_relative "broadcast_logger"
@@ -106,7 +107,6 @@ module RetainedLogging
             next false unless checkpoint_locked(now)
             next false unless ok?(@history.finish_process(process_id: @process_id, at: now))
             @stopped = true
-            @owner&.close
             true
           end
         end
@@ -118,8 +118,7 @@ module RetainedLogging
     private
 
     def reset_process
-      @owner&.close
-      @owner = nil
+      @pending_id = nil
       @pid = Process.pid
       @mutex = Mutex.new
       @state_mutex = Monitor.new
@@ -157,17 +156,13 @@ module RetainedLogging
         # again rather than retrying it forever. The uncertified interval stays a
         # gap either way, because only a checkpoint certifies coverage.
         return false unless ok?(completion) || completion["reason"] == "unknown_process"
-        @abandoned_process_id = nil
-        @owner&.close
-        @owner = nil
+        @abandoned_process_id = @pending_id = nil
       end
-      @owner ||= @history.acquire_owner
-      result = @history.start_process(component: @component, at: now, owner: @owner)
-      unless ok?(result)
-        # Reuse the identity on retry: registration may have committed before
-        # timing out. Keep its lock until retry succeeds or this process exits.
-        return false
-      end
+      # Reuse the identity on retry: registration may have committed before
+      # its caller saw the failure.
+      @pending_id ||= SecureRandom.uuid
+      result = @history.start_process(component: @component, at: now, id: @pending_id)
+      return false unless ok?(result)
       @process_id = result.fetch("process_id")
       @since = now
       true

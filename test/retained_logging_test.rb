@@ -1,12 +1,12 @@
-require "minitest/autorun"
-require "retained_logging"
+require "test_helper"
 require "active_support/tagged_logging"
 require "active_support/testing/time_helpers"
 require "stringio"
 require "tmpdir"
 require "fileutils"
-require "sqlite3"
 require "rubygems/package"
+require "open3"
+require "minitest/mock"
 
 class RetainedLoggingTest < Minitest::Test
   include ActiveSupport::Testing::TimeHelpers
@@ -121,10 +121,8 @@ class RetainedLoggingTest < Minitest::Test
   end
 
   def test_real_capture_reopens_safe_history_and_reports_failed_collection
-    Dir.mktmpdir do |directory|
-      path = File.join(directory, "history.sqlite3")
-      history = RetainedLogging::History.new(path: path, scope: "test", key: "k" * 32)
-      assert_equal "ok", history.prepare["outcome"]
+    begin
+      history = store_history
       now = Time.utc(2026, 9, 11, 12)
       capture = RetainedLogging::Capture.new(history: history, component: "job", clock: -> { now }, background: false)
       logger = RetainedLogging::Capture.install(@original, capture)
@@ -146,7 +144,7 @@ class RetainedLoggingTest < Minitest::Test
       capture.checkpoint
       now += 10
       capture.stop
-      reopened = RetainedLogging::History.new(path: path, scope: "test", key: "k" * 32)
+      reopened = RetainedLogging::History.new(scope: "test", key: "k" * 32)
       result = RetainedLogging::RetainedLogs.new(history: reopened, now: now).call("component" => "job", "lookback_minutes" => 1)
       assert_equal 1, result["total_groups"]
       assert_equal 2, result["summaries"].first["count"]
@@ -157,20 +155,16 @@ class RetainedLoggingTest < Minitest::Test
       assert_equal [ { "start" => "2026-09-11T12:00:20.000000Z", "end" => "2026-09-11T12:00:40.000000Z" } ], coverage["gaps"]
       # The group is readable, and the occurrence rows themselves still hold no text.
       assert_equal "credential=sentinel\nprivate.rb:42", result["summaries"].first["sample"]
-      SQLite3::Database.new(path, readonly: true) do |db|
-        assert_empty db.execute("SELECT * FROM events").flatten.grep(/sentinel/)
-        assert_equal [ "credential=sentinel\nprivate.rb:42" ], db.execute("SELECT sample FROM patterns").flatten
-      end
+      assert_empty RetainedLogging::Event.all.flat_map { |event| event.attributes.values }.grep(/sentinel/)
+      assert_equal [ "credential=sentinel\nprivate.rb:42" ], RetainedLogging::Sample.pluck(:sample)
       assert_includes @output.string, "failed write"
       assert_equal "ok", reopened.cleanup(at: now)["outcome"]
     end
   end
 
   def test_variable_text_shares_one_group_while_wording_and_fixed_labels_stay_separate
-    Dir.mktmpdir do |directory|
-      path = File.join(directory, "history.sqlite3")
-      history = RetainedLogging::History.new(path: path, scope: "test", key: "k" * 32)
-      assert_equal "ok", history.prepare["outcome"]
+    begin
+      history = store_history
       now = Time.utc(2026, 9, 11, 12)
       id = history.start_process(component: "web", at: now).fetch("process_id")
       pairs = [
@@ -199,10 +193,8 @@ class RetainedLoggingTest < Minitest::Test
   end
 
   def test_sample_keeps_the_first_message_is_bounded_and_expires_with_its_group
-    Dir.mktmpdir do |directory|
-      path = File.join(directory, "history.sqlite3")
-      history = RetainedLogging::History.new(path: path, scope: "test", key: "k" * 32)
-      assert_equal "ok", history.prepare["outcome"]
+    begin
+      history = store_history
       now = Time.utc(2026, 9, 11, 12)
       id = history.start_process(component: "web", at: now).fetch("process_id")
       # A multi-byte character straddles the 512 byte bound of the long message.
@@ -224,20 +216,20 @@ class RetainedLoggingTest < Minitest::Test
       [ "x" * 513, 42, nil ].each do |sample|
         assert_equal "invalid_input", history.append(process_id: id, events: [ events.first.merge("sample" => sample) ], at: now)["outcome"]
       end
-      assert_equal 2, sample_rows(path).size
+      assert_equal 2, RetainedLogging::Sample.count
       assert_equal "ok", history.cleanup(at: now + 49 * 60 * 60)["outcome"]
-      assert_empty sample_rows(path)
+      assert_equal 0, RetainedLogging::Sample.count
     end
   end
 
   def test_verification_passes_live_capture_and_names_what_is_missing
-    Dir.mktmpdir do |directory|
-      path = File.join(directory, "history.sqlite3")
-      history = RetainedLogging::History.new(path: path, scope: "test", key: "k" * 32)
-      unprepared = RetainedLogging::Verification.new(history: history, now: Time.utc(2026, 9, 11, 12, 20)).call(minutes: 15)
+    begin
+      history = store_history
+      unprepared = with_unprepared_store do
+        RetainedLogging::Verification.new(history: history, now: Time.utc(2026, 9, 11, 12, 20)).call(minutes: 15)
+      end
       assert_equal({ "ok" => false, "error" => "history_unavailable", "components" => [] }, unprepared)
 
-      assert_equal "ok", history.prepare["outcome"]
       started = Time.utc(2026, 9, 11, 12)
       micros = ->(time) { (time.to_r * 1_000_000).to_i }
       checkpoint = lambda do |id, from, to, unsupported: 0|
@@ -270,45 +262,77 @@ class RetainedLoggingTest < Minitest::Test
     end
   end
 
-  def test_obsolete_store_is_discarded_with_its_abandoned_locks_while_a_live_lock_survives
-    Dir.mktmpdir do |directory|
-      path = File.join(directory, "history.sqlite3")
-      history = RetainedLogging::History.new(path: path, scope: "test", key: "k" * 32)
-      assert_equal "ok", history.prepare["outcome"]
-      now = Time.utc(2026, 9, 11, 12)
-      abandoned = history.acquire_owner
-      history.start_process(component: "web", at: now, owner: abandoned)
-      abandoned.close
-      live = history.acquire_owner
-      history.start_process(component: "job", at: now, owner: live)
-      # A store left at a version that cannot be upgraded is replaced, not migrated.
-      SQLite3::Database.new(path) { |db| db.execute("PRAGMA user_version = 1") }
-      assert_equal "ok", history.prepare["outcome"]
-      SQLite3::Database.new(path, readonly: true) do |db|
-        assert_equal 3, db.get_first_value("PRAGMA user_version")
-        assert_equal 0, db.get_first_value("SELECT COUNT(*) FROM processes")
+  def test_cleanup_closes_a_silent_lifecycle_and_keeps_a_writing_one
+    history = store_history
+    now = Time.utc(2026, 9, 11, 12)
+    silent = history.start_process(component: "web", at: now).fetch("process_id")
+    writing = history.start_process(component: "job", at: now).fetch("process_id")
+    checkpoint = ->(from, to) { { "starts_at" => micros(from), "ends_at" => micros(to), "outcome" => "captured",
+      "informational_count" => 0, "unsupported_count" => 0 } }
+    assert_equal "ok", history.append(process_id: silent, checkpoint: checkpoint.(now, now + 10), at: now + 10)["outcome"]
+    assert_equal "ok", history.append(process_id: writing, checkpoint: checkpoint.(now, now + 290), at: now + 290)["outcome"]
+
+    # Neither has been silent for five minutes yet.
+    assert_equal 0, history.cleanup(at: now + 300)["processes_reconciled"]
+    assert_equal 1, history.cleanup(at: now + 311)["processes_reconciled"]
+    closed = RetainedLogging::Lifecycle.find_by!(uuid: silent)
+    assert_equal micros(now + 311), closed.ended_at
+    assert_nil RetainedLogging::Lifecycle.find_by!(uuid: writing).ended_at
+
+    # The closed interval after the last checkpoint stays a gap, never coverage.
+    coverage = RetainedLogging::RetainedLogs.new(history: history, now: now + 320)
+      .call("component" => "web", "lookback_minutes" => 6)["coverage"].sole
+    assert_equal "partial", coverage["availability"]
+    assert_includes coverage["reasons"], "interrupted_capture"
+
+    # A stalled owner that writes again is refused and must register afresh.
+    assert_equal "invalid_input", history.append(process_id: silent, checkpoint: checkpoint.(now + 10, now + 320), at: now + 320)["outcome"]
+    assert_equal "ok", history.finish_process(process_id: silent, at: now + 320)["outcome"]
+  end
+
+  def test_a_collector_recovers_when_cleanup_closes_its_stalled_lifecycle
+    history = store_history
+    now = Time.utc(2026, 9, 11, 12)
+    capture = RetainedLogging::Capture.new(history: history, component: "web", clock: -> { now }, background: false)
+    capture.start
+    first = RetainedLogging::Lifecycle.sole.uuid
+    now += 400
+    assert_equal 1, history.cleanup(at: now)["processes_reconciled"]
+    now += 10
+    refute capture.checkpoint
+    now += 10
+    assert capture.checkpoint
+    assert_equal 2, RetainedLogging::Lifecycle.count
+    refute_equal first, RetainedLogging::Lifecycle.where(ended_at: nil).sole.uuid
+  end
+
+  def test_store_failures_map_to_fixed_outcomes
+    history = store_history
+    {
+      ActiveRecord::QueryCanceled => "timeout",
+      ActiveRecord::StatementTimeout => "contention",
+      ActiveRecord::LockWaitTimeout => "contention",
+      ActiveRecord::Deadlocked => "contention",
+      ActiveRecord::ConnectionTimeoutError => "contention",
+      ActiveRecord::StatementInvalid => "unavailable",
+      RuntimeError => "unavailable"
+    }.each do |error, outcome|
+      RetainedLogging::Store.stub(:start, ->(**) { raise error, "credential=secret" }) do
+        assert_equal({ "outcome" => outcome }, history.start_process(component: "web"), error.name)
       end
-      refute File.exist?(RetainedLogging::ProcessOwner.path(path, abandoned.id))
-      assert File.exist?(RetainedLogging::ProcessOwner.path(path, live.id))
-      # The recreated store immediately accepts records and serves reads.
-      id = history.start_process(component: "web", at: now).fetch("process_id")
-      event = history.event(at: now, category: "warnings", message: "Import failed for /srv/one.mkv")
-      assert_equal "ok", history.append(process_id: id, events: [ event ], at: now)["outcome"]
-      result = RetainedLogging::RetainedLogs.new(history: history, now: now + 1).call("lookback_minutes" => 1)
-      assert_equal [ "Import failed for /srv/one.mkv" ], result["summaries"].map { |group| group["sample"] }
-      # A store already at the current version keeps its records.
-      assert_equal "ok", history.prepare["outcome"]
-      assert_equal 1, RetainedLogging::RetainedLogs.new(history: history, now: now + 1).call("lookback_minutes" => 1)["total_groups"]
-    ensure
-      live&.close
     end
   end
 
+  def test_the_stores_own_logging_is_not_captured
+    RetainedLogging.storing { @logger.error("store diagnostic") }
+    @logger.error("application error")
+    assert_equal [ "application error" ], @collector.records.map(&:last)
+    assert_equal "store diagnostic\napplication error\n", @output.string
+  end
+
   def test_a_full_page_of_maximum_samples_is_returned_rather_than_refused
-    Dir.mktmpdir do |directory|
-      path = File.join(directory, "history.sqlite3")
-      history = RetainedLogging::History.new(path: path, scope: "test", key: "k" * 32)
-      assert_equal "ok", history.prepare["outcome"]
+    begin
+      history = store_history
       now = Time.utc(2026, 9, 11, 12)
       id = history.start_process(component: "web", at: now).fetch("process_id")
       # Worst case escaping: a control character costs six response bytes each.
@@ -330,11 +354,7 @@ class RetainedLoggingTest < Minitest::Test
     end
   end
 
-  def sample_rows(path)
-    SQLite3::Database.new(path, readonly: true) { |db| return db.execute("SELECT scope, pattern, sample FROM patterns") }
-  end
-
-  def test_built_package_runs_storage_worker_and_summary_without_host_boot_or_paths
+  def test_built_package_migrates_and_serves_history_from_outside_the_repository
     root = File.expand_path("..", __dir__)
     spec = Gem::Specification.load(File.join(root, "retained_logging.gemspec"))
     Dir.mktmpdir do |directory|
@@ -344,11 +364,14 @@ class RetainedLoggingTest < Minitest::Test
       Gem::Package.new(archive).extract_files(extracted)
       program = <<~'PROGRAM'
         require "retained_logging"
-        abort "host loaded" if defined?(Rails) || defined?(ProductionInspection) || defined?(ActiveRecord)
-        File.write("host_boot.rb", 'File.write("host_booted", "yes"); abort "host preload executed"')
-        ENV["RUBYOPT"] = "-r#{File.expand_path('host_boot.rb')}"
-        history = RetainedLogging::History.new(path: "history.sqlite3", scope: "standalone", key: "k" * 32)
-        abort "preparation failed" unless history.prepare["outcome"] == "ok"
+        abort "host loaded" if defined?(Rails)
+        abort "store loaded before use" if defined?(ActiveRecord::Base)
+        config = { adapter: "sqlite3", database: "history.sqlite3" }
+        RetainedLogging::Record.establish_connection(config)
+        ActiveRecord::Base.establish_connection(config)
+        ActiveRecord::Migration.verbose = false
+        ActiveRecord::MigrationContext.new(RetainedLogging::MIGRATIONS_PATH).migrate
+        history = RetainedLogging::History.new(scope: "standalone", key: "k" * 32)
         now = Time.now.utc
         id = history.start_process(component: "web", at: now).fetch("process_id")
         event = history.event(at: now, category: "warnings", message: "safe test")
@@ -356,13 +379,30 @@ class RetainedLoggingTest < Minitest::Test
         result = RetainedLogging::RetainedLogs.new(history: history, now: now + 1).call({})
         abort "summary failed" unless result["total_groups"] == 1
         abort "cleanup failed" unless history.cleanup["outcome"] == "ok"
-        abort "worker loaded host" if File.exist?("host_booted")
       PROGRAM
-      output, errors, status = Open3.capture3({ "BUNDLE_GEMFILE" => nil, "RUBYOPT" => nil }, RbConfig.ruby,
-        "-I", File.join(extracted, "lib"), "-e", program, chdir: directory)
+      output, errors, status = Open3.capture3({ "BUNDLE_GEMFILE" => File.join(root, "Gemfile"), "RUBYOPT" => "-rbundler/setup" },
+        RbConfig.ruby, "-I", File.join(extracted, "lib"), "-e", program, chdir: directory)
       assert status.success?, errors
       assert_empty output
-      assert_empty errors
     end
+  end
+
+  private
+
+  def store_history
+    StoreTestSupport.reset
+    RetainedLogging::History.new(scope: "test", key: "k" * 32)
+  end
+
+  # A store whose migrations never ran answers every read as unavailable.
+  def with_unprepared_store
+    RetainedLogging::Record.establish_connection(adapter: "sqlite3", database: ":memory:")
+    yield
+  ensure
+    RetainedLogging::Record.establish_connection(StoreTestSupport.config)
+  end
+
+  def micros(time)
+    (time.to_r * 1_000_000).to_i
   end
 end

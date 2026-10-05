@@ -1,18 +1,16 @@
 require "json"
 require "openssl"
 require "securerandom"
-require "open3"
 require "active_support/message_verifier"
+require "active_support/core_ext/hash/keys"
 require_relative "category_names"
-require_relative "process_owner"
+require_relative "storing"
 
 module RetainedLogging
-  # Internal persistence API, never an MCP argument surface. No Rails connections or logger.
+  # Internal persistence API, never an MCP argument surface. It validates every
+  # value before the store sees it and reports fixed outcomes instead of raising.
   class History
     RETENTION_SECONDS = 48 * 60 * 60
-    BUDGET_SECONDS = 1
-    PREPARE_BUDGET_SECONDS = 10
-    READ_BUDGET_SECONDS = 8
     READ_RESPONSE_BYTES = 240 * 1024
     BATCH_SIZE = 100
     CLEANUP_BATCH_SIZE = 1000
@@ -37,29 +35,22 @@ module RetainedLogging
       | (?<hex>\b(?:0x(?>\h+)|(?!(?>\d+)\b)(?>\h{8,}))\b)
       | (?<number>\b(?>\d+)(?:\.(?>\d+))?\b)
     /x
-    OUTCOMES = %w[ok invalid_input unavailable contention capacity timeout].freeze
-    WORKER_LOAD_PATH = %w[sqlite3 json time date].flat_map do |name|
-      Gem::Specification.find_by_name(name).full_require_paths
-    end.join(File::PATH_SEPARATOR).freeze
+    # Errors that mean another writer or a busy store got in the way. SQLite
+    # reports a busy store as a statement timeout; Postgres reports its own
+    # statement_timeout as a cancelled query.
+    CONTENTION = [ "ActiveRecord::StatementTimeout", "ActiveRecord::LockWaitTimeout",
+      "ActiveRecord::TransactionRollbackError", "ActiveRecord::ConnectionTimeoutError",
+      "ActiveRecord::RecordNotUnique" ].freeze
+    TIMEOUT = [ "ActiveRecord::QueryCanceled" ].freeze
 
-    def initialize(path:, scope:, key:)
-      @path = path.to_s
+    def initialize(scope:, key:)
       @key = key if key.is_a?(String) && key.bytesize.between?(32, 256)
       @scope = fingerprint("scope", scope) if @key && scope.is_a?(String) && scope.bytesize.between?(1, 256)
     end
 
-    def prepare
-      execute("prepare")
-    end
-
-    def acquire_owner
-      ProcessOwner.new(@path, SecureRandom.uuid)
-    end
-
-    def start_process(component:, at: Time.now, owner: nil)
-      return failure unless @scope && %w[web job].include?(component) && timestamp(at)
-      id = owner ? owner.id : SecureRandom.uuid
-      execute("start", id: id, scope: @scope, component: component, at: timestamp(at))
+    def start_process(component:, at: Time.now, id: SecureRandom.uuid)
+      return failure unless @scope && %w[web job].include?(component) && timestamp(at) && valid_id?(id)
+      execute(:start, id: id, scope: @scope, component: component, at: timestamp(at))
     end
 
     # Normalized text is fingerprinted here, and the original text accompanies it
@@ -86,33 +77,28 @@ module RetainedLogging
       return failure unless valid_id?(process_id) && timestamp(at) && events.is_a?(Array) && events.size <= BATCH_SIZE
       return failure unless events.all? { |item| valid_event?(item) }
       return failure unless checkpoint.nil? || valid_checkpoint?(checkpoint)
-      execute("append", id: process_id, scope: @scope, events: events, checkpoint: checkpoint, at: timestamp(at))
+      execute(:append, id: process_id, scope: @scope, events: events, checkpoint: checkpoint, at: timestamp(at))
     end
 
     def finish_process(process_id:, at: Time.now)
       return failure unless valid_id?(process_id) && timestamp(at)
-      execute("finish", id: process_id, scope: @scope, at: timestamp(at))
+      execute(:finish, id: process_id, scope: @scope, at: timestamp(at))
     end
 
-    # Operator-supplied upper bound after independently confirming owner exit.
-    # Needed for legacy records that predate the process ownership lock.
-    def reconcile_process(process_id:, stopped_at:, at: Time.now)
-      return failure unless valid_id?(process_id) && timestamp(stopped_at) && timestamp(at) && stopped_at <= at
-      execute("reconcile", id: process_id, scope: @scope, at: timestamp(stopped_at))
-    end
-
-    def cleanup(at: nil)
-      clock = Time.now
-      at ||= clock
-      return failure unless timestamp(at)
-      execute("cleanup", scope: @scope, at: timestamp(at), clock_offset: timestamp(at) - timestamp(clock),
+    # Closes lifecycles that stopped writing, then expires history in bounded batches.
+    def cleanup(at: Time.now)
+      return failure unless @scope && timestamp(at)
+      execute(:cleanup, scope: @scope, at: timestamp(at),
         cutoff: timestamp(at) - RETENTION_SECONDS * 1_000_000, limit: CLEANUP_BATCH_SIZE)
     end
 
     # Only RetainedLogs supplies this internal query; no client-controlled path or SQL.
     def summarize(snapshot)
       return failure unless @scope && @key
-      execute("summarize", scope: @scope, snapshot: snapshot)
+      result = execute(:summarize, scope: @scope, snapshot: snapshot)
+      # A page must fit the reader's response budget, or it is not returned at all.
+      return { "outcome" => "unavailable" } if JSON.generate(result).bytesize > READ_RESPONSE_BYTES
+      result
     end
 
     def encode_cursor(snapshot)
@@ -199,52 +185,22 @@ module RetainedLogging
         %w[captured gap].include?(value["outcome"]) && %w[informational_count unsupported_count].all? { |k| value[k].is_a?(Integer) && value[k].between?(0, 2**31 - 1) }
     end
 
+    # Anything the store logs while it runs belongs to the gem, not the
+    # application, so capture skips it rather than recording itself.
     def execute(operation, **arguments)
-      read = operation == "summarize"
-      # Explicit schema creation/migration is maintenance, outside capture and MCP.
-      budget = case operation
-      when "prepare" then PREPARE_BUDGET_SECONDS
-      when "summarize" then READ_BUDGET_SECONDS
-      else BUDGET_SECONDS
-      end
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + budget
-      # Isolate SQLite's GVL-holding calls so cancellation cannot harm the host.
-      # Use the host-selected dependency versions without booting its whole bundle
-      # on every write. Inherited Ruby preloads must not run inside this worker.
-      input, output, waiter = Open3.popen2({ "RUBYOPT" => nil, "RUBYLIB" => nil }, RbConfig.ruby,
-        "--disable-gems", "-I", WORKER_LOAD_PATH, File.expand_path("history_worker.rb", __dir__), err: File::NULL)
-      pending = JSON.generate(arguments.merge(operation: operation, database: @path))
-      until pending.empty?
-        remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        return { "outcome" => "timeout" } unless remaining.positive? && IO.select(nil, [ input ], nil, remaining)
-        written = input.write_nonblock(pending, exception: false)
-        pending = pending.byteslice(written..) unless written == :wait_writable
-      end
-      input.close
-      raw = +""
-      loop do
-        remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        return { "outcome" => "timeout" } unless remaining.positive? && IO.select([ output ], nil, nil, remaining)
-        chunk = output.read_nonblock(1024, exception: false)
-        break if chunk.nil?
-        next if chunk == :wait_readable
-        raw << chunk
-        return { "outcome" => "unavailable" } if raw.bytesize > (read ? READ_RESPONSE_BYTES : 1024)
-      end
-      result = JSON.parse(raw)
-      OUTCOMES.include?(result["outcome"]) ? result : { "outcome" => "unavailable" }
-    rescue StandardError
-      { "outcome" => "unavailable" }
-    ensure
-      if waiter
-        begin
-          Process.kill("KILL", waiter.pid) if waiter.alive?
-        rescue Errno::ESRCH
-          # Worker exited between checking and cancellation.
+      RetainedLogging.storing do
+        require_relative "store"
+        Record.connection_pool.with_connection do
+          Record.uncached { Store.public_send(operation, **arguments) }.deep_stringify_keys
         end
-        waiter.join
       end
-      [ input, output ].compact.each { |io| io.close unless io.closed? }
+    rescue StandardError => error
+      ancestors = error.class.ancestors.map(&:name)
+      outcome = if (ancestors & TIMEOUT).any? then "timeout"
+      elsif (ancestors & CONTENTION).any? then "contention"
+      else "unavailable"
+      end
+      { "outcome" => outcome }
     end
   end
 end

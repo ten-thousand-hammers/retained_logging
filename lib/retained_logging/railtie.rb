@@ -19,6 +19,10 @@ module RetainedLogging
       # Register after ActiveSupport's configuration callbacks. Deriving a key
       # earlier can cache Rails' generator before its digest is configured.
       app.config.after_initialize do
+        # The store's own database, named in database.yml, keeps history writes
+        # off the application's connections and transactions.
+        database = app.config.retained_logging.database
+        RetainedLogging::Record.connects_to(database: { writing: database.to_sym }) if database
         integration = RetainedLogging.rails_integration
         integration.install_lifecycle_hooks
         integration.start
